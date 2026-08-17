@@ -7,6 +7,8 @@ control the client lifecycle and read connection state.
 
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
 
 import ntcore
@@ -46,6 +48,14 @@ def _to_jsonable(value: Any) -> Any:
     return value
 
 
+# NT4 clients only receive topics/values they subscribe to. Read methods are
+# async and poll the entry store with ``await asyncio.sleep`` for these
+# bounds after ensuring a subscription exists, so the event loop is never
+# blocked by a read.
+_READ_TIMEOUT_SECONDS = 1.0
+_ANNOUNCE_WAIT_SECONDS = 0.5
+
+
 class NTManager:
     """Owns the ntcore client lifecycle for the MCP server.
 
@@ -60,6 +70,11 @@ class NTManager:
     def __init__(self) -> None:
         self._inst: ntcore.NetworkTableInstance | None = None
         self._client_running: bool = False
+        self._value_subs: dict[str, ntcore.GenericSubscriber] = {}
+        self._topics_subscription: tuple[
+            ntcore.MultiSubscriber, ntcore.NetworkTableListenerPoller
+        ] | None = None
+        self._topics_synced: bool = False
 
     def _instance(self) -> ntcore.NetworkTableInstance:
         """Return the lazily created default NetworkTableInstance."""
@@ -95,6 +110,35 @@ class NTManager:
         if self._client_running and self._inst is not None:
             self._inst.stopClient()
         self._client_running = False
+        if self._topics_subscription is not None:
+            subscriber, poller = self._topics_subscription
+            subscriber.close()
+            poller.close()
+            self._topics_subscription = None
+        self._value_subs.clear()
+        self._topics_synced = False
+
+    def _ensure_topics_subscription(
+        self,
+    ) -> tuple[ntcore.MultiSubscriber, ntcore.NetworkTableListenerPoller]:
+        """Return the cached topicsOnly subscription on ``"/"``.
+
+        NT4 servers only announce topics to matching subscribers, so the
+        client's topic store (backing ``getTopicInfo``) stays empty until
+        a subscription exists. This one is topics-only: announcements
+        flow without value traffic.
+        """
+        if self._topics_subscription is None:
+            inst = self._instance()
+            subscriber = ntcore.MultiSubscriber(
+                inst, ["/"], ntcore.PubSubOptions(topicsOnly=True)
+            )
+            poller = ntcore.NetworkTableListenerPoller(inst)
+            poller.addListener(
+                subscriber, ntcore.EventFlags.kTopic | ntcore.EventFlags.kImmediate
+            )
+            self._topics_subscription = (subscriber, poller)
+        return self._topics_subscription
 
     def connection_info(self) -> dict[str, Any]:
         """Return JSON-serializable connection state.
@@ -115,3 +159,87 @@ class NTManager:
             ],
         }
         return _to_jsonable(info)
+
+    async def list_topics(self, prefix: str | None = None) -> list[str]:
+        """Return the names of all topics, optionally filtered by prefix.
+
+        Uses ``NetworkTableInstance.getTopicInfo()`` and applies the
+        ``startswith`` filter in Python so a ``None`` prefix returns every
+        topic. A topics-only subscription on ``"/"`` is kept so server
+        announcements populate the topic store; the first call after
+        connect waits briefly — yielding via ``await asyncio.sleep`` — for
+        the initial announcements to arrive.
+        """
+        inst = self._instance()
+        if self._client_running:
+            _, poller = self._ensure_topics_subscription()
+            if self._topics_synced:
+                poller.readQueue()  # drain; store updates happen in the background
+            else:
+                deadline = time.monotonic() + _ANNOUNCE_WAIT_SECONDS
+                while not poller.readQueue() and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                self._topics_synced = True
+        infos = inst.getTopicInfo()
+        if prefix is None:
+            return [info.name for info in infos]
+        return [info.name for info in infos if info.name.startswith(prefix)]
+
+    async def get(self, topic: str) -> Any:
+        """Return the JSON-normalized value of ``topic`` or ``None``.
+
+        Unpublished topics produce an invalid ``Value``, which maps to
+        ``None`` instead of raising. Metadata (valid/type/time) is never
+        exposed; the raw value is normalized through ``_to_jsonable``.
+
+        A client only receives a remote topic's value while a
+        subscription exists, so the first read of a topic creates a
+        cached ``GenericSubscriber`` and polls the entry store — yielding
+        via ``await asyncio.sleep`` — until the value arrives or
+        ``_READ_TIMEOUT_SECONDS`` elapses. When the client is not
+        running, an invalid value is returned as ``None`` immediately
+        without polling.
+        """
+        inst = self._instance()
+        entry = inst.getEntry(topic)
+        value = entry.getValue()
+        if not value.isValid() and self._client_running:
+            subscriber = self._value_subs.get(topic)
+            if subscriber is None:
+                subscriber = entry.getTopic().genericSubscribe()
+                self._value_subs[topic] = subscriber
+            deadline = time.monotonic() + _READ_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                value = entry.getValue()
+                if value.isValid():
+                    break
+                await asyncio.sleep(0.01)
+            for _ in subscriber.readQueue():  # drain; store updates in the background
+                pass
+        if not value.isValid():
+            return None
+        return _to_jsonable(value.value())
+
+    async def get_multiple(self, topics: list[str]) -> dict[str, Any]:
+        """Return ``{topic: value}`` for each topic.
+
+        Unpublished topics map to ``None``; every requested key is present
+        in the result. Reads run sequentially in submission order.
+        """
+        return {topic: await self.get(topic) for topic in topics}
+
+    async def get_info(self, topic: str) -> dict | None:
+        """Return JSON-serializable metadata for ``topic`` or ``None``.
+
+        ``{"name": str, "type_str": str, "properties": str}`` built from
+        the matching ``TopicInfo``; ``None`` if the topic is not published.
+        Pure store read — no polling, so the coroutine never yields.
+        """
+        for info in self._instance().getTopicInfo():
+            if info.name == topic:
+                return {
+                    "name": info.name,
+                    "type_str": info.type_str,
+                    "properties": info.properties,
+                }
+        return None
