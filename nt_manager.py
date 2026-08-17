@@ -9,70 +9,16 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Literal
+from typing import Any
 
 import ntcore
 
-try:  # numpy is optional — normalize numpy values only when it is present
-    import numpy as np
-except ImportError:  # pragma: no cover - venv without numpy
-    np = None  # type: ignore[assignment]
+from nt_types import array_kind, to_jsonable
 
 try:  # assert_never: typing on 3.11+, typing_extensions on 3.10
     from typing import assert_never
 except ImportError:  # pragma: no cover - Python 3.10
     from typing_extensions import assert_never
-
-_ArrayKind = Literal["boolean", "integer", "double", "string"]
-
-
-def _array_kind(values: list[Any]) -> _ArrayKind | None:
-    """Element-type tag for a homogeneous list; None if empty/mixed.
-
-    Bools are never counted as ints, so ``[True, 1]`` classifies as None.
-    Unsupported element types (nested lists, dicts, ...) classify as None.
-    """
-    if not values:
-        return None
-    if all(isinstance(value, bool) for value in values):
-        return "boolean"
-    if all(isinstance(value, int) and not isinstance(value, bool) for value in values):
-        return "integer"
-    if all(isinstance(value, float) for value in values):
-        return "double"
-    if all(isinstance(value, str) for value in values):
-        return "string"
-    return None
-
-
-def _to_jsonable(value: Any) -> Any:
-    """Normalize a value into a JSON-serializable primitive.
-
-    - ``bytes``/``bytearray``/``memoryview`` -> ``None`` (raw NT topics are
-      unsupported; bytes must never leak into tool output).
-    - numpy scalars -> ``float``/``int``/``bool``/``str`` via ``item`` casts.
-    - numpy arrays -> ``list`` (recursively normalized).
-    - ``list``/``tuple``/``dict`` recurse; anything else passes through.
-    """
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return None
-    if np is not None:
-        if isinstance(value, np.bool_):
-            return bool(value)
-        if isinstance(value, np.integer):
-            return int(value)
-        if isinstance(value, np.floating):
-            return float(value)
-        if isinstance(value, np.str_):
-            return str(value)
-        if isinstance(value, np.ndarray):
-            return [_to_jsonable(item) for item in value.tolist()]
-    if isinstance(value, (list, tuple)):
-        return [_to_jsonable(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): _to_jsonable(item) for key, item in value.items()}
-    return value
-
 
 # NT4 clients only receive topics/values they subscribe to. Read methods are
 # async and poll the entry store with ``await asyncio.sleep`` for these
@@ -184,7 +130,7 @@ class NTManager:
                 for conn in inst.getConnections()
             ],
         }
-        return _to_jsonable(info)
+        return to_jsonable(info)
 
     async def list_topics(self, prefix: str | None = None) -> list[str]:
         """Return the names of all topics, optionally filtered by prefix.
@@ -216,7 +162,7 @@ class NTManager:
 
         Unpublished topics produce an invalid ``Value``, which maps to
         ``None`` instead of raising. Metadata (valid/type/time) is never
-        exposed; the raw value is normalized through ``_to_jsonable``.
+        exposed; the raw value is normalized through ``to_jsonable``.
 
         A client only receives a remote topic's value while a
         subscription exists, so the first read of a topic creates a
@@ -244,7 +190,7 @@ class NTManager:
                 pass
         if not value.isValid():
             return None
-        return _to_jsonable(value.value())
+        return to_jsonable(value.value())
 
     async def get_multiple(self, topics: list[str]) -> dict[str, Any]:
         """Return ``{topic: value}`` for each topic.
@@ -287,7 +233,7 @@ class NTManager:
         if isinstance(value, str):
             return entry.setString(value)
         if isinstance(value, list):
-            kind = _array_kind(value)
+            kind = array_kind(value)
             if kind is None:
                 return False
             match kind:
@@ -332,7 +278,7 @@ class NTManager:
                     results.setdefault(data.topic.getName(), []).append(
                         {
                             "time": data.value.last_change() / 1_000_000.0,
-                            "value": _to_jsonable(data.value.value()),
+                            "value": to_jsonable(data.value.value()),
                         }
                     )
                 remaining = end - time.monotonic()
