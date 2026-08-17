@@ -13,3 +13,6 @@ tools/.e2e-stderr.txt
 tools/.sim-stdout.txt
 tools/.sim-stderr.txt
 tools/.sim-pid.txt
+tools/.mcp-client-check.txt
+tools/.mcp-registration.txt
+tools/.f3-output.txt
