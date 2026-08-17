@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+from typing import Any, Literal
 
 import ntcore
 
@@ -17,6 +17,32 @@ try:  # numpy is optional — normalize numpy values only when it is present
     import numpy as np
 except ImportError:  # pragma: no cover - venv without numpy
     np = None  # type: ignore[assignment]
+
+try:  # assert_never: typing on 3.11+, typing_extensions on 3.10
+    from typing import assert_never
+except ImportError:  # pragma: no cover - Python 3.10
+    from typing_extensions import assert_never
+
+_ArrayKind = Literal["boolean", "integer", "double", "string"]
+
+
+def _array_kind(values: list[Any]) -> _ArrayKind | None:
+    """Element-type tag for a homogeneous list; None if empty/mixed.
+
+    Bools are never counted as ints, so ``[True, 1]`` classifies as None.
+    Unsupported element types (nested lists, dicts, ...) classify as None.
+    """
+    if not values:
+        return None
+    if all(isinstance(value, bool) for value in values):
+        return "boolean"
+    if all(isinstance(value, int) and not isinstance(value, bool) for value in values):
+        return "integer"
+    if all(isinstance(value, float) for value in values):
+        return "double"
+    if all(isinstance(value, str) for value in values):
+        return "string"
+    return None
 
 
 def _to_jsonable(value: Any) -> Any:
@@ -243,3 +269,77 @@ class NTManager:
                     "properties": info.properties,
                 }
         return None
+
+    def set(self, topic: str, value: Any) -> bool:
+        """Publish ``value`` to ``topic``; return the setter's bool result.
+
+        Dispatches on the Python type — bool checked before int — to the
+        matching entry setter; homogeneous lists use the array setters.
+        Unsupported or mixed types return ``False`` without raising.
+        """
+        entry = self._instance().getEntry(topic)
+        if isinstance(value, bool):
+            return entry.setBoolean(value)
+        if isinstance(value, int):
+            return entry.setInteger(value)
+        if isinstance(value, float):
+            return entry.setDouble(value)
+        if isinstance(value, str):
+            return entry.setString(value)
+        if isinstance(value, list):
+            kind = _array_kind(value)
+            if kind is None:
+                return False
+            match kind:
+                case "boolean":
+                    return entry.setBooleanArray(value)
+                case "integer":
+                    return entry.setIntegerArray(value)
+                case "double":
+                    return entry.setDoubleArray(value)
+                case "string":
+                    return entry.setStringArray(value)
+                case unreachable:
+                    assert_never(unreachable)
+        return False
+
+    def set_multiple(self, updates: dict[str, Any]) -> dict[str, bool]:
+        """Write every ``{topic: value}`` pair; return per-topic results."""
+        return {topic: self.set(topic, value) for topic, value in updates.items()}
+
+    async def subscribe(
+        self, prefixes: list[str], duration: float = 10.0
+    ) -> dict[str, list[dict]]:
+        """Sample every value update under ``prefixes`` for ``duration`` s.
+
+        Returns ``{topic: [{"time": float_s, "value": jsonable}, ...]}``.
+        ``kImmediate`` emits the current value once per topic, then
+        ``kValueAll`` on every change. Disconnect or no published topics
+        yield ``{}``; subscriber and poller are always closed.
+        """
+        inst = self._instance()
+        subscriber = ntcore.MultiSubscriber(inst, prefixes, ntcore.PubSubOptions())
+        poller = ntcore.NetworkTableListenerPoller(inst)
+        poller.addListener(
+            subscriber, ntcore.EventFlags.kValueAll | ntcore.EventFlags.kImmediate
+        )
+        results: dict[str, list[dict]] = {}
+        end = time.monotonic() + duration
+        try:
+            while True:
+                for event in poller.readQueue():
+                    data = event.data
+                    results.setdefault(data.topic.getName(), []).append(
+                        {
+                            "time": data.value.last_change() / 1_000_000.0,
+                            "value": _to_jsonable(data.value.value()),
+                        }
+                    )
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(0.02, remaining))
+        finally:
+            subscriber.close()
+            poller.close()
+        return results
