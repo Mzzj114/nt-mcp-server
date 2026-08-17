@@ -7,3 +7,9 @@ __pycache__/
 networktables.json
 tests/.pytest-report.txt
 tests/.server-smoke.txt
+tools/.e2e-output.txt
+tools/.e2e-stdout.txt
+tools/.e2e-stderr.txt
+tools/.sim-stdout.txt
+tools/.sim-stderr.txt
+tools/.sim-pid.txt
