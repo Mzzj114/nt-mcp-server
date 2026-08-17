@@ -6,3 +6,4 @@ __pycache__/
 .codegraph/
 networktables.json
 tests/.pytest-report.txt
+tests/.server-smoke.txt
