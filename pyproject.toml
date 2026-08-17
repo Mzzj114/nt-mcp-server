@@ -1,0 +1,9 @@
+[project]
+name = "nt-mcp-server"
+version = "0.1.0"
+description = "MCP server exposing FRC NetworkTables data via FastMCP"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp==3.4.7",
+    "pyntcore==2026.2.2",
+]

@@ -1,0 +1,2 @@
+fastmcp==3.4.7
+pyntcore==2026.2.2
