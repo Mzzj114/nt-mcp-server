@@ -7,12 +7,14 @@ nt_mcp_server.py`` (stdio transport, the default for ``mcp.run()``).
 """
 
 import asyncio
+import os
 import time
 from typing import Any
 
 from fastmcp import FastMCP
 
 from nt_manager import NTManager
+import nt_recorder
 
 mcp = FastMCP("NetworkTables")
 manager = NTManager()
@@ -107,6 +109,71 @@ async def nt_subscribe(prefixes: list[str], duration: float = 10.0) -> dict:
     Returns ``{topic: [{"time": float_s, "value": jsonable}, ...]}``.
     """
     return await manager.subscribe(prefixes, duration)
+
+
+@mcp.tool()
+def nt_list_recordings(output_dir: str | None = None) -> list[dict]:
+    """List available NDJSON recordings in the output directory.
+
+    Returns a list of ``{"id": filename, "path": full_path, "size_bytes": int, "modified": float}``
+    sorted newest-first. ``output_dir`` defaults to ``$NT_RECORDINGS_DIR`` or ``./recordings``.
+    """
+    dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
+    return nt_recorder.list_recordings(dir_)
+
+
+@mcp.tool()
+def nt_get_history(
+    topic: str,
+    recording_id: str | None = None,
+    start: float | None = None,
+    end: float | None = None,
+    limit: int | None = None,
+    output_dir: str | None = None,
+) -> list[dict]:
+    """Return event history for one topic from a recording.
+
+    Each entry is ``{"time": float, "value": jsonable}``. ``start`` is inclusive,
+    ``end`` is exclusive. If ``recording_id`` is None, uses the most recent recording.
+    ``output_dir`` defaults to ``$NT_RECORDINGS_DIR`` or ``./recordings``.
+    """
+    dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
+    return nt_recorder.get_history(topic, recording_id, dir_, start, end, limit)
+
+
+@mcp.tool()
+def nt_list_topics_offline(
+    recording_id: str | None = None,
+    prefix: str | None = None,
+    output_dir: str | None = None,
+) -> list[str]:
+    """List unique topic names in a recording, optionally filtered by prefix.
+
+    If ``recording_id`` is None, uses the most recent recording.
+    ``output_dir`` defaults to ``$NT_RECORDINGS_DIR`` or ``./recordings``.
+    """
+    dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
+    return nt_recorder.list_topics(recording_id, dir_, prefix)
+
+
+@mcp.tool()
+def nt_subscribe_offline(
+    prefixes: list[str],
+    recording_id: str | None = None,
+    start: float | None = None,
+    end: float | None = None,
+    limit: int | None = None,
+    output_dir: str | None = None,
+) -> dict[str, list[dict]]:
+    """Return events for every topic under ``prefixes`` from a recording.
+
+    Returns ``{topic: [{"time": float, "value": jsonable}, ...]}`` — same shape as
+    live ``nt_subscribe``. ``start`` is inclusive, ``end`` is exclusive. If
+    ``recording_id`` is None, uses the most recent recording. ``output_dir`` defaults
+    to ``$NT_RECORDINGS_DIR`` or ``./recordings``.
+    """
+    dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
+    return nt_recorder.subscribe_offline(prefixes, recording_id, dir_, start, end, limit)
 
 
 if __name__ == "__main__":
