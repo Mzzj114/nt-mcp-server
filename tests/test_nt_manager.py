@@ -236,3 +236,23 @@ async def test_subscribe_stream_yields_fixture_events(manager: NTManager) -> Non
     for name, events in seen.items():
         if name in FIXTURE_VALUES:
             assert any(value == FIXTURE_VALUES[name] for value, _ in events)
+
+
+@pytest.mark.anyio
+async def test_subscribe_stream_all_topics(manager: NTManager) -> None:
+    """subscribe_stream(["/"]) — the root prefix — yields every fixture topic.
+
+    Validates that the default recording prefix captures all topics that
+    list_topics() reports. Consumes the generator for 1.0s via
+    ``asyncio.timeout`` (the generator only yields on value updates, so a
+    bare ``time.monotonic`` check inside the ``async for`` would never
+    fire between events).
+    """
+    topics_seen: set[str] = set()
+    try:
+        async with asyncio.timeout(1.0):
+            async for topic, _, _ in manager.subscribe_stream(["/"]):
+                topics_seen.add(topic)
+    except TimeoutError:
+        pass
+    assert set(topics_seen) >= set(FIXTURE_NAMES)
