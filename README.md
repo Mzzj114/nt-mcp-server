@@ -26,9 +26,28 @@ cd D:\Program\Hardware\try-robotpy && .venv\Scripts\activate && python -m robotp
 
 The server connects to `127.0.0.1:5810` by default, which is where the sim listens.
 
+## Record NetworkTables to NDJSON (offline)
+
+The `nt_recorder.py` CLI connects to a live NT4 server and writes value events to a timestamped `.ndjson` file. It runs on the dev laptop and reads NT from the sim or robot; no robot-side changes are needed.
+
+```powershell
+.venv\Scripts\python.exe nt_recorder.py --prefixes /SmartDashboard/ --output-dir recordings
+```
+
+Options:
+- `--prefixes` — topic prefixes to subscribe to (default: `/`)
+- `--output-dir` — directory for output files (default: `./recordings`)
+- `--duration` — record for N seconds, then exit (default: run until Ctrl+C)
+- `--team` — connect via team number instead of server IP/port
+- `--server-ip` / `--server-port` — NT4 server address (default: `127.0.0.1:5810`)
+- `--identity` — client identity string (default: `nt-recorder`)
+- `--quiet` — suppress status output to stderr
+
+Output files are named `nt-record-<YYYY-MM-DDTHHMMSSZ>.ndjson` (no colons, Windows-safe). Each line is `{"time": float, "topic": str, "value": jsonable}`. Exit codes: 0 clean, 1 connection failure, 2 disk/IO error.
+
 ## Tools
 
-The server exposes 10 tools. Values are returned in JSON-normalized (raw) form, never wrapped in metadata.
+The server exposes 14 tools (10 live + 4 offline). Values are returned in JSON-normalized (raw) form, never wrapped in metadata.
 
 | Tool | Description |
 | --- | --- |
@@ -42,6 +61,17 @@ The server exposes 10 tools. Values are returned in JSON-normalized (raw) form, 
 | `nt_set_multiple` | Write every `{topic: value}` pair; returns per-topic results. |
 | `nt_list_topics` | List all topic names, optionally filtered by a prefix. |
 | `nt_subscribe` | Sample value updates under topic prefixes for a given duration. |
+
+### Offline recording tools
+
+| Tool | Description |
+| --- | --- |
+| `nt_list_recordings` | List available NDJSON recordings in the output directory. |
+| `nt_get_history` | Return event history for one topic from a recording. |
+| `nt_list_topics_offline` | List unique topic names in a recording, optionally filtered by prefix. |
+| `nt_subscribe_offline` | Return events for every topic under prefixes from a recording. |
+
+The offline tools read from the directory set by the `NT_RECORDINGS_DIR` environment variable (defaults to `./recordings`). Recordings are local-only — the recorder runs on the dev laptop and reads NT from the sim/robot; no robot-side changes are needed.
 
 ## Register in opencode
 
