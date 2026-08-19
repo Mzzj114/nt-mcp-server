@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import AsyncIterator
 from typing import Any
 
 import ntcore
@@ -253,6 +254,40 @@ class NTManager:
         """Write every ``{topic: value}`` pair; return per-topic results."""
         return {topic: self.set(topic, value) for topic, value in updates.items()}
 
+    async def subscribe_stream(
+        self, prefixes: list[str]
+    ) -> AsyncIterator[tuple[str, Any, float]]:
+        """Yield ``(topic, value, time_seconds)`` for every value update under ``prefixes``.
+
+        Runs indefinitely until the consumer stops iterating. Each stream
+        owns its own ``MultiSubscriber`` and ``NetworkTableListenerPoller``
+        (fresh per call; never reused from ``self``); both are closed in a
+        ``finally`` block when the generator is closed. ``kImmediate`` emits
+        the current value once per topic, then ``kValueAll`` on every change.
+        """
+        inst = self._instance()
+        subscriber = ntcore.MultiSubscriber(inst, prefixes, ntcore.PubSubOptions())
+        poller = ntcore.NetworkTableListenerPoller(inst)
+        poller.addListener(
+            subscriber, ntcore.EventFlags.kValueAll | ntcore.EventFlags.kImmediate
+        )
+        try:
+            while True:
+                events = poller.readQueue()
+                if events:
+                    for event in events:
+                        data = event.data
+                        yield (
+                            data.topic.getName(),
+                            to_jsonable(data.value.value()),
+                            data.value.last_change() / 1_000_000.0,
+                        )
+                else:
+                    await asyncio.sleep(0.02)
+        finally:
+            subscriber.close()
+            poller.close()
+
     async def subscribe(
         self, prefixes: list[str], duration: float = 10.0
     ) -> dict[str, list[dict]]:
@@ -261,31 +296,25 @@ class NTManager:
         Returns ``{topic: [{"time": float_s, "value": jsonable}, ...]}``.
         ``kImmediate`` emits the current value once per topic, then
         ``kValueAll`` on every change. Disconnect or no published topics
-        yield ``{}``; subscriber and poller are always closed.
+        yield ``{}``; subscriber and poller are always closed (via
+        ``subscribe_stream``'s ``finally``).
+
+        ``asyncio.timeout`` enforces the deadline when no events flow
+        (the generator only yields on value updates, so a bare
+        ``time.monotonic`` check inside the ``async for`` would never
+        fire between events). The monotonic check still provides an
+        early exit when events are flowing past the deadline.
         """
-        inst = self._instance()
-        subscriber = ntcore.MultiSubscriber(inst, prefixes, ntcore.PubSubOptions())
-        poller = ntcore.NetworkTableListenerPoller(inst)
-        poller.addListener(
-            subscriber, ntcore.EventFlags.kValueAll | ntcore.EventFlags.kImmediate
-        )
         results: dict[str, list[dict]] = {}
         end = time.monotonic() + duration
         try:
-            while True:
-                for event in poller.readQueue():
-                    data = event.data
-                    results.setdefault(data.topic.getName(), []).append(
-                        {
-                            "time": data.value.last_change() / 1_000_000.0,
-                            "value": to_jsonable(data.value.value()),
-                        }
+            async with asyncio.timeout(duration):
+                async for topic, value, time_seconds in self.subscribe_stream(prefixes):
+                    results.setdefault(topic, []).append(
+                        {"time": time_seconds, "value": value}
                     )
-                remaining = end - time.monotonic()
-                if remaining <= 0:
-                    break
-                await asyncio.sleep(min(0.02, remaining))
-        finally:
-            subscriber.close()
-            poller.close()
+                    if time.monotonic() >= end:
+                        break
+        except TimeoutError:
+            pass
         return results

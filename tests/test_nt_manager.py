@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from typing import Any
 
 import ntcore
 import pytest
@@ -202,3 +203,36 @@ async def test_subscribe_samples_every_fixture_topic(manager: NTManager) -> None
             assert isinstance(event["time"], float)
         if name in FIXTURE_VALUES:
             assert any(event["value"] == FIXTURE_VALUES[name] for event in events)
+
+
+@pytest.mark.anyio
+async def test_subscribe_stream_yields_fixture_events(manager: NTManager) -> None:
+    """subscribe_stream yields (topic, value, time) tuples for every fixture topic.
+
+    Consumes the generator for 1.0s via ``asyncio.timeout`` (the generator
+    only yields on value updates, so a bare ``time.monotonic`` check inside
+    the ``async for`` would never fire between events). Each yielded tuple
+    must have a str topic, a float time, and a bare value (not wrapped in
+    metadata like ``{"value": ...}``).
+    """
+    seen: dict[str, list[tuple[Any, float]]] = {}
+    try:
+        async with asyncio.timeout(1.0):
+            async for topic, value, time_seconds in manager.subscribe_stream(
+                ["/SmartDashboard/"]
+            ):
+                assert isinstance(topic, str)
+                assert isinstance(time_seconds, float)
+                # bare value, not wrapped in metadata like {"value": ...} or {"time": ...}
+                assert not (
+                    isinstance(value, dict) and ("value" in value or "time" in value)
+                )
+                seen.setdefault(topic, []).append((value, time_seconds))
+    except TimeoutError:
+        pass
+    for name in FIXTURE_NAMES:
+        assert name in seen, f"no event for {name}"
+        assert len(seen[name]) >= 1
+    for name, events in seen.items():
+        if name in FIXTURE_VALUES:
+            assert any(value == FIXTURE_VALUES[name] for value, _ in events)
