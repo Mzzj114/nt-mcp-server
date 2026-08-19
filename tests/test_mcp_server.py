@@ -28,6 +28,7 @@ import ntcore
 import pytest
 
 import nt_mcp_server
+import nt_recorder
 
 PORT = 5810
 
@@ -202,3 +203,117 @@ async def test_nt_disconnect_returns_status_and_reconnects(mcp_synced: None) -> 
     ), "client still connected after nt_disconnect"
     status = await nt_mcp_server.nt_connect(server_ip="127.0.0.1", server_port=PORT)
     assert status == "connected"
+
+
+# --- Offline MCP tool tests (Task 7) ----------------------------------------
+# These exercise the 4 synchronous offline tools against a recording produced
+# via nt_recorder.Recorder on the connected nt_mcp_server.manager. The offline
+# tools read NDJSON files, not live NT streams. Singleton caveat: the default
+# NT instance may carry topics published by earlier tests in this module
+# (e.g. /SmartDashboard/mcp_int from test_nt_set_int_roundtrip_preserves_type),
+# so assertions use subset checks (set(FIXTURE_NAMES) <= set(result)) rather
+# than equality, and prefix filtering is verified by checking every returned
+# topic matches the prefix.
+
+
+@pytest.mark.anyio
+async def test_nt_list_recordings_returns_metadata(
+    mcp_synced: None, tmp_path
+) -> None:
+    """Given a recording, nt_list_recordings returns metadata entries."""
+    recorder = nt_recorder.Recorder(
+        nt_mcp_server.manager,
+        output_dir=str(tmp_path),
+        prefixes=["/SmartDashboard/"],
+        duration=1.0,
+    )
+    await recorder.run()
+    result = nt_mcp_server.nt_list_recordings(output_dir=str(tmp_path))
+    assert isinstance(result, list)
+    assert len(result) >= 1
+    for entry in result:
+        assert {"id", "path", "size_bytes", "modified"} <= set(entry)
+    json.dumps(result)
+
+
+@pytest.mark.anyio
+async def test_nt_get_history_returns_events(mcp_synced: None, tmp_path) -> None:
+    """Given a recording, nt_get_history returns {time, value} events."""
+    recorder = nt_recorder.Recorder(
+        nt_mcp_server.manager,
+        output_dir=str(tmp_path),
+        prefixes=["/SmartDashboard/"],
+        duration=1.0,
+    )
+    await recorder.run()
+    result = nt_mcp_server.nt_get_history(
+        "/SmartDashboard/test_num", output_dir=str(tmp_path)
+    )
+    assert isinstance(result, list)
+    assert len(result) >= 1
+    for entry in result:
+        assert sorted(entry) == ["time", "value"]
+        assert isinstance(entry["time"], float)
+    assert any(entry["value"] == 42.0 for entry in result)
+    json.dumps(result)
+
+
+@pytest.mark.anyio
+async def test_nt_list_topics_offline_returns_topics(
+    mcp_synced: None, tmp_path
+) -> None:
+    """Given a recording, nt_list_topics_offline returns topics; prefix narrows."""
+    recorder = nt_recorder.Recorder(
+        nt_mcp_server.manager,
+        output_dir=str(tmp_path),
+        prefixes=["/SmartDashboard/"],
+        duration=1.0,
+    )
+    await recorder.run()
+    all_topics = nt_mcp_server.nt_list_topics_offline(output_dir=str(tmp_path))
+    assert set(FIXTURE_NAMES) <= set(all_topics)
+    prefixed = nt_mcp_server.nt_list_topics_offline(
+        output_dir=str(tmp_path), prefix="/SmartDashboard/"
+    )
+    assert all(topic.startswith("/SmartDashboard/") for topic in prefixed)
+    assert set(FIXTURE_NAMES) <= set(prefixed)
+    json.dumps(prefixed)
+
+
+@pytest.mark.anyio
+async def test_nt_subscribe_offline_returns_dict(
+    mcp_synced: None, tmp_path
+) -> None:
+    """Given a recording, nt_subscribe_offline buckets events by topic."""
+    recorder = nt_recorder.Recorder(
+        nt_mcp_server.manager,
+        output_dir=str(tmp_path),
+        prefixes=["/SmartDashboard/"],
+        duration=1.0,
+    )
+    await recorder.run()
+    result = nt_mcp_server.nt_subscribe_offline(
+        ["/SmartDashboard/"], output_dir=str(tmp_path)
+    )
+    assert isinstance(result, dict)
+    for name in FIXTURE_NAMES:
+        assert name in result, f"missing topic {name}"
+        for entry in result[name]:
+            assert sorted(entry) == ["time", "value"]
+            assert isinstance(entry["time"], float)
+    assert (
+        nt_mcp_server.nt_subscribe_offline(
+            ["/does/not/exist/"], output_dir=str(tmp_path)
+        )
+        == {}
+    )
+    json.dumps(result)
+
+
+def test_nt_get_history_missing_recording_returns_empty() -> None:
+    """Given a missing recording_id, nt_get_history returns [] (never raises)."""
+    result = nt_mcp_server.nt_get_history(
+        "/x", recording_id="nonexistent.ndjson", output_dir="."
+    )
+    assert result == []
+    json.dumps(result)
