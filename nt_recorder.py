@@ -25,7 +25,7 @@ import os
 import signal
 import sys
 import time
-from typing import Any
+from typing import Any, Iterator
 
 from nt_manager import NTManager
 
@@ -125,6 +125,197 @@ async def _wait_for_connection(manager: NTManager) -> bool:
             return True
         await asyncio.sleep(_CONNECT_POLL_SECONDS)
     return manager.connection_info()["connected"]
+
+
+# --- Offline reader API -----------------------------------------------------
+# Synchronous readers for NDJSON recording files. No live NT connection.
+# Do NOT call these on a file currently being written by an active Recorder;
+# the reader has no writer-detection — the caller must ensure the recording
+# is closed first.
+
+
+def _resolve_recording(
+    recording_id: str | None,
+    output_dir: str,
+) -> str | None:
+    """Return the path to the recording to read, or ``None`` if none exists.
+
+    If ``recording_id`` is given, return ``output_dir / recording_id`` when
+    that file exists, else ``None``. If ``recording_id`` is ``None``, return
+    the path to the most recent ``.ndjson`` file in ``output_dir`` (or
+    ``None`` if the directory is missing or empty).
+    """
+    if recording_id is not None:
+        path = os.path.join(output_dir, recording_id)
+        return path if os.path.isfile(path) else None
+    recordings = list_recordings(output_dir)
+    if not recordings:
+        return None
+    return recordings[0]["path"]
+
+
+def _iter_events(path: str) -> Iterator[dict]:
+    """Yield parsed event dicts from an NDJSON recording file.
+
+    Skips blank lines and malformed JSON lines (warning to stderr). If the
+    file does not exist, yields nothing.
+    """
+    if not os.path.isfile(path):
+        return
+    with open(path, "r", encoding="utf-8") as file:
+        for line in file:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                yield json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                print(
+                    f"WARNING: skipping malformed line: {exc}",
+                    file=sys.stderr,
+                )
+
+
+def list_recordings(output_dir: str = "./recordings") -> list[dict]:
+    """List ``.ndjson`` recordings in ``output_dir``, newest first.
+
+    Returns a list of
+    ``{"id": filename, "path": full_path, "size_bytes": int, "modified": float}``
+    for each ``.ndjson`` file. If ``output_dir`` does not exist, returns
+    ``[]``.
+
+    Note: do not call reader functions on a recording currently being
+    written by an active ``Recorder``.
+    """
+    if not os.path.isdir(output_dir):
+        return []
+    entries: list[dict] = []
+    for name in os.listdir(output_dir):
+        if not name.endswith(".ndjson"):
+            continue
+        full = os.path.join(output_dir, name)
+        if not os.path.isfile(full):
+            continue
+        stat = os.stat(full)
+        entries.append(
+            {
+                "id": name,
+                "path": full,
+                "size_bytes": stat.st_size,
+                "modified": stat.st_mtime,
+            }
+        )
+    entries.sort(key=lambda r: r["modified"], reverse=True)
+    return entries
+
+
+def list_topics(
+    recording_id: str | None = None,
+    output_dir: str = "./recordings",
+    prefix: str | None = None,
+) -> list[str]:
+    """List unique topic names in a recording, sorted.
+
+    If ``recording_id`` is ``None``, reads the most recent recording in
+    ``output_dir``. If ``prefix`` is given, only topics starting with it are
+    returned. Missing file or empty recording returns ``[]``. Malformed
+    lines are skipped with a warning to stderr.
+
+    Note: do not call on a recording currently being written.
+    """
+    path = _resolve_recording(recording_id, output_dir)
+    if path is None:
+        return []
+    topics: set[str] = set()
+    for event in _iter_events(path):
+        topic = event.get("topic")
+        if not isinstance(topic, str):
+            continue
+        if prefix is not None and not topic.startswith(prefix):
+            continue
+        topics.add(topic)
+    return sorted(topics)
+
+
+def get_history(
+    topic: str,
+    recording_id: str | None = None,
+    output_dir: str = "./recordings",
+    start: float | None = None,
+    end: float | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    """Return the event history for one topic.
+
+    Each entry is ``{"time": float, "value": jsonable}`` — same shape as
+    live ``nt_subscribe`` entries. ``start`` is inclusive (``time >= start``);
+    ``end`` is exclusive (``time < end``). If ``limit`` is given, at most
+    ``limit`` entries are returned (after filtering). Missing file returns
+    ``[]``. Malformed lines are skipped with a warning to stderr.
+
+    Note: do not call on a recording currently being written.
+    """
+    path = _resolve_recording(recording_id, output_dir)
+    if path is None:
+        return []
+    out: list[dict] = []
+    for event in _iter_events(path):
+        if event.get("topic") != topic:
+            continue
+        raw_time = event.get("time")
+        if not isinstance(raw_time, (int, float)):
+            continue
+        t = float(raw_time)
+        if start is not None and t < start:
+            continue
+        if end is not None and t >= end:
+            continue
+        out.append({"time": t, "value": event.get("value")})
+        if limit is not None and len(out) >= limit:
+            break
+    return out
+
+
+def subscribe_offline(
+    prefixes: list[str],
+    recording_id: str | None = None,
+    output_dir: str = "./recordings",
+    start: float | None = None,
+    end: float | None = None,
+    limit: int | None = None,
+) -> dict[str, list[dict]]:
+    """Return events for every topic under ``prefixes``.
+
+    Returns ``{topic: [{"time": float, "value": jsonable}, ...]}`` — same
+    shape as live ``nt_subscribe``. ``start`` is inclusive, ``end`` is
+    exclusive. If ``limit`` is given, it is applied per-topic (each topic
+    gets at most ``limit`` entries). Missing file returns ``{}``. Malformed
+    lines are skipped with a warning to stderr.
+
+    Note: do not call on a recording currently being written.
+    """
+    path = _resolve_recording(recording_id, output_dir)
+    if path is None:
+        return {}
+    out: dict[str, list[dict]] = {}
+    for event in _iter_events(path):
+        topic = event.get("topic")
+        if not isinstance(topic, str):
+            continue
+        if not any(topic.startswith(p) for p in prefixes):
+            continue
+        raw_time = event.get("time")
+        if not isinstance(raw_time, (int, float)):
+            continue
+        t = float(raw_time)
+        if start is not None and t < start:
+            continue
+        if end is not None and t >= end:
+            continue
+        if limit is not None and len(out.get(topic, ())) >= limit:
+            continue
+        out.setdefault(topic, []).append({"time": t, "value": event.get("value")})
+    return out
 
 
 async def main() -> int:
