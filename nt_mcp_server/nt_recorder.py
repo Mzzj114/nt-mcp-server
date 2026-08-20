@@ -9,9 +9,9 @@ Exit codes: 0 clean, 1 connection failure, 2 disk/IO error.
 
 Usage::
 
-    python nt_recorder.py --prefixes /SmartDashboard/ --output-dir ./recordings
-    python nt_recorder.py --team 254 --duration 30
-    python nt_recorder.py --duration 0.1 --prefixes /SmartDashboard/ --output-dir tests/tmp_recordings
+    uv run nt-recorder --prefixes /SmartDashboard/ --output-dir ./recordings
+    python -m nt_mcp_server.nt_recorder --team 254 --duration 30
+    python -m nt_mcp_server.nt_recorder --duration 0.1 --prefixes /SmartDashboard/ --output-dir tests/tmp_recordings
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ import sys
 import time
 from typing import Any, Iterator
 
-from nt_manager import NTManager
-from nt_types import summarize
+from .nt_manager import NTManager
+from .nt_types import summarize
 
 _CONNECT_TIMEOUT_SECONDS = 5.0
 _CONNECT_POLL_SECONDS = 0.05
@@ -521,6 +521,11 @@ async def main() -> int:
         manager.disconnect()
 
     return 0
+
+
+def _sync_main() -> None:
+    """Console-script entry point (sync wrapper around async main)."""
+    raise SystemExit(asyncio.run(main()))
 
 
 if __name__ == "__main__":

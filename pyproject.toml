@@ -3,7 +3,21 @@ name = "nt-mcp-server"
 version = "0.1.0"
 description = "MCP server exposing FRC NetworkTables data via FastMCP"
 requires-python = ">=3.10"
+license = "MIT"
+readme = "README.md"
+authors = [{ name = "nt-mcp-server" }]
 dependencies = [
     "fastmcp==3.4.7",
     "pyntcore==2026.2.2",
 ]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project.scripts]
+nt-mcp-server = "nt_mcp_server:main"
+nt-recorder = "nt_mcp_server.nt_recorder:_sync_main"
+
+[tool.setuptools]
+packages = ["nt_mcp_server"]

@@ -2,8 +2,8 @@
 
 Thin MCP layer: every tool delegates to the module-level ``NTManager``
 from ``nt_manager``. No ntcore imports here — all NetworkTables logic
-lives in the manager. Run with ``.venv\\Scripts\\python.exe
-nt_mcp_server.py`` (stdio transport, the default for ``mcp.run()``).
+lives in the manager. Run with ``uv run nt-mcp-server`` or
+``python -m nt_mcp_server`` (stdio transport, the default for ``mcp.run()``).
 """
 
 import asyncio
@@ -15,8 +15,8 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-from nt_manager import NTManager
-import nt_recorder
+from .nt_manager import NTManager
+from . import nt_recorder
 
 mcp = FastMCP("NetworkTables")
 manager = NTManager()
@@ -375,5 +375,5 @@ def nt_subscribe_offline(
     )
 
 
-if __name__ == "__main__":
+def main() -> None:
     mcp.run()

@@ -3,10 +3,7 @@
   "mcp": {
     "nt": {
       "type": "local",
-      "command": [
-        "D:\\Program\\Hardware\\nt-mcp-server\\.venv\\Scripts\\python.exe",
-        "D:\\Program\\Hardware\\nt-mcp-server\\nt_mcp_server.py"
-      ],
+      "command": ["uv", "run", "nt-mcp-server"],
       "enabled": true
     }
   }

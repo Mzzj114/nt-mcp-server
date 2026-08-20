@@ -28,7 +28,7 @@ import ntcore
 import pytest
 
 import nt_mcp_server
-import nt_recorder
+from nt_mcp_server import nt_recorder
 
 PORT = 5810
 

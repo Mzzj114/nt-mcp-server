@@ -12,3 +12,7 @@ tools/.*.txt
 recordings/
 
 note.txt
+
+build/
+dist/
+*.egg-info/

@@ -19,8 +19,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 import ntcore
 import pytest
 
-import nt_recorder
-from nt_manager import NTManager
+from nt_mcp_server import nt_recorder
+from nt_mcp_server.nt_manager import NTManager
 
 PORT = 5810
 

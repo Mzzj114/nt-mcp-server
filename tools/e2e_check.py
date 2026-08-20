@@ -1,13 +1,13 @@
 """E2E check for nt-mcp-server against the live RobotPy sim.
 
 Run while ``python -m robotpy sim --nogui`` is serving NT4 on
-``127.0.0.1:5810`` (start it from ``D:\\Program\\Hardware\\try-robotpy``
-with its own venv). Exercises the real ``NTManager`` against the real
+``127.0.0.1:5810`` (start it from your RobotPy sim project with its own
+venv). Exercises the real ``NTManager`` against the real
 sim: connect, list topics, read the Swerve pose, write + read back a
 marker, and sample a subscription. Prints PASS/FAIL per assertion and
 exits 0 only when every assertion passes.
 
-Usage: ``.venv\\Scripts\\python.exe tools\\e2e_check.py``
+Usage: ``uv run python tools\\e2e_check.py``
 """
 
 from __future__ import annotations
@@ -15,11 +15,8 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from nt_manager import NTManager  # noqa: E402
+from nt_mcp_server.nt_manager import NTManager
 
 CONNECT_TIMEOUT_SECONDS = 5.0
 POSE_TOPIC = "/SmartDashboard/Swerve/Pose X"

@@ -26,7 +26,7 @@ from typing import Any
 import ntcore
 import pytest
 
-from nt_manager import NTManager
+from nt_mcp_server.nt_manager import NTManager
 
 PORT = 5810
 

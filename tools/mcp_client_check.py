@@ -1,12 +1,13 @@
 """Headless stdio MCP client smoke check for nt_mcp_server.
 
-Spawns ``nt_mcp_server.py`` as a subprocess and speaks newline-delimited
-JSON-RPC 2.0 over stdio: ``initialize`` -> ``notifications/initialized``
--> ``tools/call`` for ``nt_connect``, ``nt_list_topics`` and ``nt_get``.
-Exits 0 only when ``nt_get`` on the Swerve pose topic returns a bare
-float. Run against the live sim or a loopback NT4 server on 5810.
+Spawns the server with ``python -m nt_mcp_server`` as a subprocess and
+speaks newline-delimited JSON-RPC 2.0 over stdio: ``initialize`` ->
+``notifications/initialized`` -> ``tools/call`` for ``nt_connect``,
+``nt_list_topics`` and ``nt_get``. Exits 0 only when ``nt_get`` on the
+Swerve pose topic returns a bare float. Run against the live sim or a
+loopback NT4 server on 5810.
 
-Usage: ``.venv\\Scripts\\python.exe tools\\mcp_client_check.py``
+Usage: ``uv run python tools\\mcp_client_check.py``
 """
 
 from __future__ import annotations
@@ -17,12 +18,8 @@ import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent.parent
-SERVER_SCRIPT = ROOT / "nt_mcp_server.py"
-PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 POSE_TOPIC = "/SmartDashboard/Swerve/Pose X"
 
 REQUEST_TIMEOUT_SECONDS = 30.0
@@ -117,7 +114,7 @@ def _text_of(result: dict[str, Any]) -> str:
 
 def main() -> int:
     proc = subprocess.Popen(
-        [str(PYTHON), str(SERVER_SCRIPT)],
+        [sys.executable, "-m", "nt_mcp_server"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

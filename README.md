@@ -6,12 +6,18 @@ This project lives as a sibling to `try-robotpy` and never touches it. It has it
 
 ## try-robotpy untouched
 
-`nt-mcp-server` is a sibling project to `try-robotpy` (both live under `D:\Program\Hardware\`), and nothing is added to the robot repo. The server has its own venv, its own pinned dependencies, and its own git history. `try-robotpy`'s `git status` stays clean, so nothing new can reach the roboRIO deploy surface. The only interaction is the sim process itself, which the server connects to over NT4 at `127.0.0.1:5810`.
+`nt-mcp-server` is a sibling project to `try-robotpy` (both live side-by-side in the same parent directory), and nothing is added to the robot repo. The server has its own venv, its own pinned dependencies, and its own git history. `try-robotpy`'s `git status` stays clean, so nothing new can reach the roboRIO deploy surface. The only interaction is the sim process itself, which the server connects to over NT4 at `127.0.0.1:5810`.
 
 ## Run the server
 
 ```powershell
-.venv\Scripts\python.exe nt_mcp_server.py
+uv run nt-mcp-server
+```
+
+Or, equivalently, from a checkout without uv's shim:
+
+```powershell
+python -m nt_mcp_server
 ```
 
 The server runs on stdio, which is how MCP clients (like opencode) talk to it.
@@ -21,17 +27,17 @@ The server runs on stdio, which is how MCP clients (like opencode) talk to it.
 The sim must be running before the server can read or write anything useful. Start it from its own project and venv:
 
 ```powershell
-cd D:\Program\Hardware\try-robotpy && .venv\Scripts\activate && python -m robotpy sim
+cd <path-to-try-robotpy> && .venv\Scripts\activate && python -m robotpy sim
 ```
 
 The server connects to `127.0.0.1:5810` by default, which is where the sim listens.
 
 ## Record NetworkTables to NDJSON (offline)
 
-The `nt_recorder.py` CLI connects to a live NT4 server and writes value events to a timestamped `.ndjson` file. It runs on the dev laptop and reads NT from the sim or robot; no robot-side changes are needed.
+The `nt-recorder` CLI connects to a live NT4 server and writes value events to a timestamped `.ndjson` file. It runs on the dev laptop and reads NT from the sim or robot; no robot-side changes are needed.
 
 ```powershell
-.venv\Scripts\python.exe nt_recorder.py --prefixes /SmartDashboard/ --output-dir recordings
+uv run nt-recorder --prefixes /SmartDashboard/ --output-dir recordings
 ```
 
 Options:
@@ -79,9 +85,22 @@ The server exposes 17 tools (13 live + 4 offline). Every live tool response incl
 
 The offline tools read from the directory set by the `NT_RECORDINGS_DIR` environment variable (defaults to `./recordings`). Recordings are local-only — the recorder runs on the dev laptop and reads NT from the sim/robot; no robot-side changes are needed.
 
-## Register in opencode
+## Register in any agent
 
-Add this entry to the project-level `opencode.jsonc` at the repo root:
+The server is a uvx-runnable package from git, so any MCP client can launch it without a local checkout or a pre-built venv. Run it on demand:
+
+```powershell
+uvx --from git+https://github.com/<your-repo>/nt-mcp-server.git nt-mcp-server
+```
+
+Or install the console script once and run it anywhere:
+
+```powershell
+uv tool install "git+https://github.com/<your-repo>/nt-mcp-server.git"
+uvx nt-mcp-server
+```
+
+Add this entry to your agent's MCP config (shown here as opencode's project-level `opencode.jsonc` at the repo root):
 
 ```jsonc
 {
@@ -89,8 +108,10 @@ Add this entry to the project-level `opencode.jsonc` at the repo root:
     "nt": {
       "type": "local",
       "command": [
-        "D:\\Program\\Hardware\\nt-mcp-server\\.venv\\Scripts\\python.exe",
-        "D:\\Program\\Hardware\\nt-mcp-server\\nt_mcp_server.py"
+        "uvx",
+        "--from",
+        "git+https://github.com/<your-repo>/nt-mcp-server.git",
+        "nt-mcp-server"
       ],
       "enabled": true
     }
@@ -103,4 +124,4 @@ Verify with `opencode mcp list` from the project root: the `nt` server should sh
 ## Development
 
 - Python 3.14.0 venv in `.venv`; deps installed from `requirements.txt` (`fastmcp==3.4.7`, `pyntcore==2026.2.2`).
-- Tests: `.venv\Scripts\python.exe -m pytest tests/ -v`
+- Tests: `uv run pytest tests/ -v`

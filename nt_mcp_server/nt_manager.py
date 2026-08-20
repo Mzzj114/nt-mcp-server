@@ -16,7 +16,7 @@ from typing import Any
 
 import ntcore
 
-from nt_types import array_kind, summarize, to_jsonable, type_warning
+from .nt_types import array_kind, summarize, to_jsonable, type_warning
 
 try:  # assert_never: typing on 3.11+, typing_extensions on 3.10
     from typing import assert_never
