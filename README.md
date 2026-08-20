@@ -47,29 +47,35 @@ Output files are named `nt-record-<YYYY-MM-DDTHHMMSSZ>.ndjson` (no colons, Windo
 
 ## Tools
 
-The server exposes 14 tools (10 live + 4 offline). Values are returned in JSON-normalized (raw) form, never wrapped in metadata.
+The server exposes 17 tools (13 live + 4 offline). Every live tool response includes a `connected` flag. If the NT server is disconnected, live tools return `{"connected": false, "error": "NT server disconnected"}` instead of empty or schema-invalid output.
+
+### Live tools
 
 | Tool | Description |
 | --- | --- |
-| `nt_connect` | Start the NT4 client and wait for a live connection (default `127.0.0.1:5810`). |
-| `nt_disconnect` | Stop the NT4 client; safe to call before any connect. |
+| `nt_connect` | Start the NT4 client and wait for a live connection. Returns `{"connected": bool, "status": "connected" \| "not connected"}`. |
+| `nt_disconnect` | Stop the NT4 client and tear down persistent subscriptions. Returns `{"connected": false, "status": "disconnected"}`. |
 | `nt_connection_info` | Return connection state: `{"connected": bool, "connections": [...]}`. |
-| `nt_get` | Return the JSON-normalized value of one topic, or `None` if unpublished. |
-| `nt_get_multiple` | Return `{topic: value}` for every requested topic (`None` for unpublished ones). |
-| `nt_get_info` | Return topic metadata: name, type, properties. |
-| `nt_set` | Publish a value to a topic; returns the setter's boolean result. |
-| `nt_set_multiple` | Write every `{topic: value}` pair; returns per-topic results. |
-| `nt_list_topics` | List all topic names, optionally filtered by a prefix. |
-| `nt_subscribe` | Sample value updates under topic prefixes for a given duration. |
+| `nt_get` | Return the JSON-normalized value of one topic. Response: `{"connected": bool, "value": jsonable \| null}`. |
+| `nt_get_multiple` | Return every requested topic. Response: `{"connected": bool, "values": {topic: value}}`. |
+| `nt_get_info` | Return topic metadata. Response: `{"connected": bool, "info": {name, type_str, properties} \| null}`. |
+| `nt_set` | Publish a value. Response: `{"connected": bool, "ok": bool, "warning": str \| null}`. Add `strict_type_check=True` to refuse type mismatches. |
+| `nt_set_multiple` | Write every `{topic: value}` pair. Response: `{"connected": bool, "results": {...}, "warnings": {...}}`. |
+| `nt_list_topics` | List topic names, filtered by `prefix`, `regex`, and/or `wildcard`. Response: `{"connected": bool, "topics": [...]}`. |
+| `nt_subscribe` | Sample updates under prefixes for `duration` seconds. Response: `{"connected": bool, "samples": {topic: [...] \| summary}}`. Supports `sample_interval`, `change_only`, and `format="summary"`. |
+| `nt_start_subscription` | Open a persistent subscription. Response: `{"connected": bool, "subscription_id": str, "started": bool}`. |
+| `nt_poll_subscription` | Read buffered samples from a persistent subscription. Response: `{"connected": bool, "samples": {topic: [...]}}`. |
+| `nt_stop_subscription` | Stop a persistent subscription. Response: `{"connected": bool, "stopped": bool}`. |
 
 ### Offline recording tools
 
 | Tool | Description |
 | --- | --- |
-| `nt_list_recordings` | List available NDJSON recordings in the output directory. |
-| `nt_get_history` | Return event history for one topic from a recording. |
-| `nt_list_topics_offline` | List unique topic names in a recording, optionally filtered by prefix. |
-| `nt_subscribe_offline` | Return events for every topic under prefixes from a recording. |
+| `nt_list_recordings` | List recordings. Each entry includes `id`, `path`, `size_bytes`, `modified` (Unix float), and `modified_iso` (UTC ISO-8601). |
+| `nt_get_recording_info` | Return duration, total sample count, topic count, and file metadata for a recording. |
+| `nt_get_history` | Return event history for one topic. Supports `last_seconds`, `sample_interval`, and `format="summary"`. |
+| `nt_list_topics_offline` | List unique topic names in a recording, filtered by `prefix`, `regex`, and/or `wildcard`. |
+| `nt_subscribe_offline` | Return events for every topic under prefixes. Supports `last_seconds`, `sample_interval`, and `format="summary"`. |
 
 The offline tools read from the directory set by the `NT_RECORDINGS_DIR` environment variable (defaults to `./recordings`). Recordings are local-only — the recorder runs on the dev laptop and reads NT from the sim/robot; no robot-side changes are needed.
 

@@ -20,14 +20,17 @@ import argparse
 import asyncio
 import contextlib
 import datetime
+import fnmatch
 import json
 import os
+import re
 import signal
 import sys
 import time
 from typing import Any, Iterator
 
 from nt_manager import NTManager
+from nt_types import summarize
 
 _CONNECT_TIMEOUT_SECONDS = 5.0
 _CONNECT_POLL_SECONDS = 0.05
@@ -176,13 +179,73 @@ def _iter_events(path: str) -> Iterator[dict]:
                 )
 
 
+def _iter_timed_events(path: str) -> Iterator[tuple[float, dict]]:
+    """Yield ``(time, event)`` for events with a valid numeric time."""
+    for event in _iter_events(path):
+        raw_time = event.get("time")
+        if isinstance(raw_time, (int, float)):
+            yield float(raw_time), event
+
+
+def _time_bounds(path: str) -> tuple[float, float] | None:
+    """Return ``(min_time, max_time)`` across all valid events, or ``None``."""
+    min_time: float | None = None
+    max_time: float | None = None
+    for t, _ in _iter_timed_events(path):
+        if min_time is None or t < min_time:
+            min_time = t
+        if max_time is None or t > max_time:
+            max_time = t
+    if min_time is None or max_time is None:
+        return None
+    return min_time, max_time
+
+
+def _matches_filters(
+    topic: str,
+    prefix: str | None,
+    regex: str | None,
+    wildcard: str | None,
+) -> bool:
+    """Return True when ``topic`` matches all supplied filters."""
+    if prefix is not None and not topic.startswith(prefix):
+        return False
+    if regex is not None and not re.search(regex, topic):
+        return False
+    if wildcard is not None and not fnmatch.fnmatch(topic, wildcard):
+        return False
+    return True
+
+
+def _downsample(
+    events: list[dict], sample_interval: float
+) -> list[dict]:
+    """Keep at most one event per ``sample_interval`` seconds."""
+    if sample_interval is None or sample_interval <= 0:
+        return events
+    last_time: dict[str, float] = {}
+    out: list[dict] = []
+    for event in events:
+        topic = event.get("topic", "")
+        t = event["time"]
+        if t - last_time.get(topic, -sample_interval) >= sample_interval:
+            last_time[topic] = t
+            out.append(event)
+    return out
+
+
+def _iso_timestamp(unix_time: float) -> str:
+    """Return a UTC ISO-8601 string for a Unix timestamp."""
+    return datetime.datetime.fromtimestamp(unix_time, tz=datetime.timezone.utc).isoformat()
+
+
 def list_recordings(output_dir: str = "./recordings") -> list[dict]:
     """List ``.ndjson`` recordings in ``output_dir``, newest first.
 
     Returns a list of
-    ``{"id": filename, "path": full_path, "size_bytes": int, "modified": float}``
-    for each ``.ndjson`` file. If ``output_dir`` does not exist, returns
-    ``[]``.
+    ``{"id": filename, "path": full_path, "size_bytes": int,
+    "modified": float, "modified_iso": str}`` for each ``.ndjson`` file.
+    If ``output_dir`` does not exist, returns ``[]``.
 
     Note: do not call reader functions on a recording currently being
     written by an active ``Recorder``.
@@ -203,6 +266,7 @@ def list_recordings(output_dir: str = "./recordings") -> list[dict]:
                 "path": full,
                 "size_bytes": stat.st_size,
                 "modified": stat.st_mtime,
+                "modified_iso": _iso_timestamp(stat.st_mtime),
             }
         )
     entries.sort(key=lambda r: r["modified"], reverse=True)
@@ -213,13 +277,15 @@ def list_topics(
     recording_id: str | None = None,
     output_dir: str = "./recordings",
     prefix: str | None = None,
+    regex: str | None = None,
+    wildcard: str | None = None,
 ) -> list[str]:
     """List unique topic names in a recording, sorted.
 
     If ``recording_id`` is ``None``, reads the most recent recording in
-    ``output_dir``. If ``prefix`` is given, only topics starting with it are
-    returned. Missing file or empty recording returns ``[]``. Malformed
-    lines are skipped with a warning to stderr.
+    ``output_dir``. ``prefix``, ``regex`` and ``wildcard`` filters are
+    applied together. Missing file or empty recording returns ``[]``.
+    Malformed lines are skipped with a warning to stderr.
 
     Note: do not call on a recording currently being written.
     """
@@ -231,10 +297,26 @@ def list_topics(
         topic = event.get("topic")
         if not isinstance(topic, str):
             continue
-        if prefix is not None and not topic.startswith(prefix):
+        if not _matches_filters(topic, prefix, regex, wildcard):
             continue
         topics.add(topic)
     return sorted(topics)
+
+
+def _apply_time_filter(
+    path: str,
+    start: float | None,
+    end: float | None,
+    last_seconds: float | None,
+) -> tuple[float | None, float | None]:
+    """Resolve ``last_seconds`` into an absolute ``start`` bound."""
+    if last_seconds is not None:
+        bounds = _time_bounds(path)
+        if bounds is not None:
+            computed_start = bounds[1] - last_seconds
+            if start is None or computed_start > start:
+                start = computed_start
+    return start, end
 
 
 def get_history(
@@ -243,37 +325,77 @@ def get_history(
     output_dir: str = "./recordings",
     start: float | None = None,
     end: float | None = None,
+    last_seconds: float | None = None,
     limit: int | None = None,
-) -> list[dict]:
+    sample_interval: float | None = None,
+    format: str = "samples",
+) -> list[dict] | dict:
     """Return the event history for one topic.
 
     Each entry is ``{"time": float, "value": jsonable}`` — same shape as
     live ``nt_subscribe`` entries. ``start`` is inclusive (``time >= start``);
-    ``end`` is exclusive (``time < end``). If ``limit`` is given, at most
-    ``limit`` entries are returned (after filtering). Missing file returns
-    ``[]``. Malformed lines are skipped with a warning to stderr.
+    ``end`` is exclusive (``time < end``). ``last_seconds`` selects the most
+    recent N seconds. ``sample_interval`` decimates the samples, and
+    ``format="summary"`` returns min/max/mean/last.
 
-    Note: do not call on a recording currently being written.
+    Missing file returns ``[]``. Malformed lines are skipped with a warning
+    to stderr.
     """
     path = _resolve_recording(recording_id, output_dir)
     if path is None:
         return []
-    out: list[dict] = []
-    for event in _iter_events(path):
+    start, end = _apply_time_filter(path, start, end, last_seconds)
+    events: list[dict] = []
+    for t, event in _iter_timed_events(path):
         if event.get("topic") != topic:
             continue
-        raw_time = event.get("time")
-        if not isinstance(raw_time, (int, float)):
-            continue
-        t = float(raw_time)
         if start is not None and t < start:
             continue
         if end is not None and t >= end:
             continue
-        out.append({"time": t, "value": event.get("value")})
-        if limit is not None and len(out) >= limit:
+        events.append({"time": t, "value": event.get("value")})
+        if limit is not None and len(events) >= limit:
             break
-    return out
+    if sample_interval is not None:
+        events = _downsample(events, sample_interval)
+    if format == "summary":
+        return summarize(events)
+    return events
+
+
+def get_recording_info(
+    recording_id: str | None = None,
+    output_dir: str = "./recordings",
+) -> dict:
+    """Return metadata for a recording.
+
+    Includes ``duration_seconds``, ``total_samples``, ``topic_count``,
+    ``id``, ``path``, ``size_bytes``, ``modified`` and ``modified_iso``.
+    Missing file returns an ``error`` key.
+    """
+    path = _resolve_recording(recording_id, output_dir)
+    if path is None:
+        return {"error": "no recording found"}
+    bounds = _time_bounds(path)
+    duration = bounds[1] - bounds[0] if bounds else 0.0
+    total = 0
+    topics: set[str] = set()
+    for event in _iter_events(path):
+        total += 1
+        topic = event.get("topic")
+        if isinstance(topic, str):
+            topics.add(topic)
+    stat = os.stat(path)
+    return {
+        "id": os.path.basename(path),
+        "path": path,
+        "size_bytes": stat.st_size,
+        "modified": stat.st_mtime,
+        "modified_iso": _iso_timestamp(stat.st_mtime),
+        "duration_seconds": duration,
+        "total_samples": total,
+        "topic_count": len(topics),
+    }
 
 
 def subscribe_offline(
@@ -282,32 +404,33 @@ def subscribe_offline(
     output_dir: str = "./recordings",
     start: float | None = None,
     end: float | None = None,
+    last_seconds: float | None = None,
     limit: int | None = None,
-) -> dict[str, list[dict]]:
+    sample_interval: float | None = None,
+    format: str = "samples",
+) -> dict[str, Any]:
     """Return events for every topic under ``prefixes``.
 
-    Returns ``{topic: [{"time": float, "value": jsonable}, ...]}`` — same
-    shape as live ``nt_subscribe``. ``start`` is inclusive, ``end`` is
-    exclusive. If ``limit`` is given, it is applied per-topic (each topic
-    gets at most ``limit`` entries). Missing file returns ``{}``. Malformed
-    lines are skipped with a warning to stderr.
+    Returns ``{topic: [{"time": float, "value": jsonable}, ...] | summary}``.
+    ``start`` is inclusive, ``end`` is exclusive. ``last_seconds`` selects
+    the most recent N seconds. If ``limit`` is given, it is applied per-topic
+    (each topic gets at most ``limit`` entries). ``sample_interval`` and
+    ``format="summary"`` behave like live ``nt_subscribe``. Missing file
+    returns ``{}``. Malformed lines are skipped with a warning to stderr.
 
     Note: do not call on a recording currently being written.
     """
     path = _resolve_recording(recording_id, output_dir)
     if path is None:
         return {}
+    start, end = _apply_time_filter(path, start, end, last_seconds)
     out: dict[str, list[dict]] = {}
-    for event in _iter_events(path):
+    for t, event in _iter_timed_events(path):
         topic = event.get("topic")
         if not isinstance(topic, str):
             continue
         if not any(topic.startswith(p) for p in prefixes):
             continue
-        raw_time = event.get("time")
-        if not isinstance(raw_time, (int, float)):
-            continue
-        t = float(raw_time)
         if start is not None and t < start:
             continue
         if end is not None and t >= end:
@@ -315,6 +438,10 @@ def subscribe_offline(
         if limit is not None and len(out.get(topic, ())) >= limit:
             continue
         out.setdefault(topic, []).append({"time": t, "value": event.get("value")})
+    if sample_interval is not None:
+        out = {topic: _downsample(samples, sample_interval) for topic, samples in out.items()}
+    if format == "summary":
+        return {topic: summarize(samples) for topic, samples in out.items()}
     return out
 
 

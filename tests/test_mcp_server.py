@@ -2,7 +2,7 @@
 
 Each run spins up a real pyntcore NT4 server in-process
 (``NetworkTableInstance.create()``) on port 5810 — the same loopback
-recipe as ``tests/test_nt_manager.py`` — and drives the 10 MCP tools as
+recipe as ``tests/test_nt_manager.py`` — and drives the MCP tools as
 plain functions from :mod:`nt_mcp_server` (``nt_mcp_server.nt_get(...)``
 etc.), never through the stdio transport.
 
@@ -74,12 +74,13 @@ async def mcp_synced(nt_server: ntcore.NetworkTableInstance) -> AsyncIterator[No
     status = await nt_mcp_server.nt_connect(
         server_ip="127.0.0.1", server_port=PORT, identity="mcp-test"
     )
-    assert status == "connected", "nt_connect never reached the fixture server"
+    assert status == {"connected": True, "status": "connected"}
 
     async def synced() -> bool:
-        names = await nt_mcp_server.nt_list_topics()
+        result = await nt_mcp_server.nt_list_topics()
+        names = result["topics"]
         return all(name in names for name in FIXTURE_NAMES) and (
-            await nt_mcp_server.nt_get("/SmartDashboard/test_num") is not None
+            (await nt_mcp_server.nt_get("/SmartDashboard/test_num"))["value"] is not None
         )
 
     assert await wait_until(synced, timeout=15.0), "tools never synced fixture topics"
@@ -91,7 +92,7 @@ async def mcp_synced(nt_server: ntcore.NetworkTableInstance) -> AsyncIterator[No
 async def test_nt_connect_returns_connected(mcp_synced: None) -> None:
     """Given the synced fixture, nt_connect is idempotent and reports connected."""
     status = await nt_mcp_server.nt_connect(server_ip="127.0.0.1", server_port=PORT)
-    assert status == "connected"
+    assert status == {"connected": True, "status": "connected"}
 
 
 @pytest.mark.anyio
@@ -104,26 +105,39 @@ async def test_nt_connection_info_is_json_serializable(mcp_synced: None) -> None
 
 @pytest.mark.anyio
 async def test_nt_get_returns_bare_value(mcp_synced: None) -> None:
-    """Given a published double, nt_get returns a bare float, not metadata."""
-    value = await nt_mcp_server.nt_get("/SmartDashboard/test_num")
-    assert value == 42.0
-    assert type(value) is float
+    """Given a published double, nt_get returns a wrapped value with connected flag."""
+    response = await nt_mcp_server.nt_get("/SmartDashboard/test_num")
+    assert response["connected"] is True
+    assert response["value"] == 42.0
+    assert type(response["value"]) is float
 
 
 @pytest.mark.anyio
 async def test_nt_get_info_returns_type_str(mcp_synced: None) -> None:
     """Given a published topic, nt_get_info returns metadata with type_str."""
-    info = await nt_mcp_server.nt_get_info("/SmartDashboard/test_num")
+    response = await nt_mcp_server.nt_get_info("/SmartDashboard/test_num")
+    assert response["connected"] is True
+    info = response["info"]
     assert info is not None
     assert info["name"] == "/SmartDashboard/test_num"
     assert info["type_str"] == "double"
 
 
 @pytest.mark.anyio
+async def test_nt_get_info_unknown_topic(mcp_synced: None) -> None:
+    """Unknown topics return connected=True and info=None (no schema error)."""
+    response = await nt_mcp_server.nt_get_info("/SmartDashboard/does_not_exist")
+    assert response["connected"] is True
+    assert response["info"] is None
+    json.dumps(response)
+
+
+@pytest.mark.anyio
 async def test_nt_set_int_roundtrip_preserves_type(mcp_synced: None) -> None:
     """Given nt_set(7), nt_get returns the same int."""
-    assert nt_mcp_server.nt_set("/SmartDashboard/mcp_int", 7) is True
-    value = await nt_mcp_server.nt_get("/SmartDashboard/mcp_int")
+    response = nt_mcp_server.nt_set("/SmartDashboard/mcp_int", 7)
+    assert response == {"connected": True, "ok": True, "warning": None}
+    value = (await nt_mcp_server.nt_get("/SmartDashboard/mcp_int"))["value"]
     assert value == 7
     assert type(value) is int
 
@@ -131,8 +145,9 @@ async def test_nt_set_int_roundtrip_preserves_type(mcp_synced: None) -> None:
 @pytest.mark.anyio
 async def test_nt_set_float_roundtrip_preserves_type(mcp_synced: None) -> None:
     """Given nt_set(2.5), nt_get returns the same float."""
-    assert nt_mcp_server.nt_set("/SmartDashboard/mcp_double", 2.5) is True
-    value = await nt_mcp_server.nt_get("/SmartDashboard/mcp_double")
+    response = nt_mcp_server.nt_set("/SmartDashboard/mcp_double", 2.5)
+    assert response == {"connected": True, "ok": True, "warning": None}
+    value = (await nt_mcp_server.nt_get("/SmartDashboard/mcp_double"))["value"]
     assert value == 2.5
     assert type(value) is float
 
@@ -140,8 +155,9 @@ async def test_nt_set_float_roundtrip_preserves_type(mcp_synced: None) -> None:
 @pytest.mark.anyio
 async def test_nt_set_bool_roundtrip_preserves_type(mcp_synced: None) -> None:
     """Given nt_set(False), nt_get returns the same bool."""
-    assert nt_mcp_server.nt_set("/SmartDashboard/mcp_bool", False) is True
-    value = await nt_mcp_server.nt_get("/SmartDashboard/mcp_bool")
+    response = nt_mcp_server.nt_set("/SmartDashboard/mcp_bool", False)
+    assert response == {"connected": True, "ok": True, "warning": None}
+    value = (await nt_mcp_server.nt_get("/SmartDashboard/mcp_bool"))["value"]
     assert value is False
     assert type(value) is bool
 
@@ -149,23 +165,29 @@ async def test_nt_set_bool_roundtrip_preserves_type(mcp_synced: None) -> None:
 @pytest.mark.anyio
 async def test_nt_set_multiple_returns_dict_of_bools(mcp_synced: None) -> None:
     """Given two topics, nt_set_multiple returns per-topic bool results."""
-    result = nt_mcp_server.nt_set_multiple(
+    response = nt_mcp_server.nt_set_multiple(
         {"/SmartDashboard/mcp_multi_int": 11, "/SmartDashboard/mcp_multi_str": "abc"}
     )
-    assert result == {
+    assert response["connected"] is True
+    assert response["results"] == {
         "/SmartDashboard/mcp_multi_int": True,
         "/SmartDashboard/mcp_multi_str": True,
     }
-    assert all(type(ok) is bool for ok in result.values())
+    assert all(type(ok) is bool for ok in response["results"].values())
+    assert response["warnings"] == {
+        "/SmartDashboard/mcp_multi_int": None,
+        "/SmartDashboard/mcp_multi_str": None,
+    }
 
 
 @pytest.mark.anyio
 async def test_nt_get_multiple_returns_flat_dict(mcp_synced: None) -> None:
-    """Given three topics, nt_get_multiple returns a flat {topic: value} dict."""
-    result = await nt_mcp_server.nt_get_multiple(
+    """Given three topics, nt_get_multiple returns a wrapped {topic: value} dict."""
+    response = await nt_mcp_server.nt_get_multiple(
         ["/SmartDashboard/test_num", "/SmartDashboard/test_str", "/SmartDashboard/nope"]
     )
-    assert result == {
+    assert response["connected"] is True
+    assert response["values"] == {
         "/SmartDashboard/test_num": 42.0,
         "/SmartDashboard/test_str": "hi",
         "/SmartDashboard/nope": None,
@@ -175,25 +197,78 @@ async def test_nt_get_multiple_returns_flat_dict(mcp_synced: None) -> None:
 @pytest.mark.anyio
 async def test_nt_list_topics_prefix_filter(mcp_synced: None) -> None:
     """Given a prefix, nt_list_topics narrows to matching topics."""
-    names = await nt_mcp_server.nt_list_topics("/SmartDashboard/test_")
-    assert set(FIXTURE_NAMES) <= set(names)
-    assert await nt_mcp_server.nt_list_topics("/does/not/match/") == []
+    response = await nt_mcp_server.nt_list_topics("/SmartDashboard/test_")
+    assert response["connected"] is True
+    assert set(FIXTURE_NAMES) <= set(response["topics"])
+    empty = await nt_mcp_server.nt_list_topics("/does/not/match/")
+    assert empty == {"connected": True, "topics": []}
+
+
+@pytest.mark.anyio
+async def test_nt_list_topics_regex_filter(mcp_synced: None) -> None:
+    """Regex filter works through the MCP wrapper."""
+    response = await nt_mcp_server.nt_list_topics(regex=r"test_(num|str)$")
+    assert response["connected"] is True
+    assert "/SmartDashboard/test_num" in response["topics"]
+    assert "/SmartDashboard/test_bool" not in response["topics"]
 
 
 @pytest.mark.anyio
 async def test_nt_subscribe_returns_json_samples(mcp_synced: None) -> None:
     """Given the fixture prefix, nt_subscribe samples every topic as JSON."""
-    samples = await nt_mcp_server.nt_subscribe(["/SmartDashboard/"], duration=1.0)
+    response = await nt_mcp_server.nt_subscribe(["/SmartDashboard/"], duration=1.0)
+    assert response["connected"] is True
+    samples = response["samples"]
     for name in FIXTURE_NAMES:
         assert name in samples, f"no samples for {name}"
         assert len(samples[name]) >= 1
-    json.dumps(samples)
+    json.dumps(response)
+
+
+@pytest.mark.anyio
+async def test_nt_subscribe_summary_format(mcp_synced: None) -> None:
+    """format='summary' returns min/max/mean/last per topic."""
+    response = await nt_mcp_server.nt_subscribe(
+        ["/SmartDashboard/"], duration=1.0, format="summary"
+    )
+    assert response["connected"] is True
+    summary = response["samples"]["/SmartDashboard/test_num"]
+    assert summary["count"] >= 1
+    assert summary["last_value"] == 42.0
+    assert "min" in summary
+
+
+@pytest.mark.anyio
+async def test_nt_set_type_warning(mcp_synced: None) -> None:
+    """Writing wrong type to a known topic produces a warning.
+
+    NT itself refuses cross-type writes, so ``ok`` may be False even in
+    warn mode; the important behavior is that a warning is surfaced.
+    """
+    # Use a fresh topic so the mismatch does not corrupt fixture topics.
+    nt_mcp_server.nt_set("/SmartDashboard/mcp_warn_num", 1.0)
+    response = nt_mcp_server.nt_set("/SmartDashboard/mcp_warn_num", "not a number")
+    assert response["connected"] is True
+    assert response["warning"] is not None
+    assert "expected double" in response["warning"]
+
+
+@pytest.mark.anyio
+async def test_nt_set_strict_type_check(mcp_synced: None) -> None:
+    """strict_type_check=True refuses mismatched writes."""
+    nt_mcp_server.nt_set("/SmartDashboard/mcp_strict_num", 1.0)
+    response = nt_mcp_server.nt_set(
+        "/SmartDashboard/mcp_strict_num", "not a number", strict_type_check=True
+    )
+    assert response["connected"] is True
+    assert response["ok"] is False
+    assert response["warning"] is not None
 
 
 @pytest.mark.anyio
 async def test_nt_disconnect_returns_status_and_reconnects(mcp_synced: None) -> None:
     """Given a live client, nt_disconnect stops it; nt_connect restores it."""
-    assert nt_mcp_server.nt_disconnect() == "disconnected"
+    assert nt_mcp_server.nt_disconnect() == {"connected": False, "status": "disconnected"}
 
     async def disconnected() -> bool:
         return nt_mcp_server.nt_connection_info()["connected"] is False
@@ -201,19 +276,40 @@ async def test_nt_disconnect_returns_status_and_reconnects(mcp_synced: None) -> 
     assert await wait_until(
         disconnected, timeout=2.0
     ), "client still connected after nt_disconnect"
+
+    # After disconnect, read tools report the disconnected state clearly.
+    response = await nt_mcp_server.nt_get_info("/SmartDashboard/test_num")
+    assert response["connected"] is False
+    assert "error" in response
+
     status = await nt_mcp_server.nt_connect(server_ip="127.0.0.1", server_port=PORT)
-    assert status == "connected"
+    assert status == {"connected": True, "status": "connected"}
 
 
-# --- Offline MCP tool tests (Task 7) ----------------------------------------
-# These exercise the 4 synchronous offline tools against a recording produced
-# via nt_recorder.Recorder on the connected nt_mcp_server.manager. The offline
-# tools read NDJSON files, not live NT streams. Singleton caveat: the default
-# NT instance may carry topics published by earlier tests in this module
-# (e.g. /SmartDashboard/mcp_int from test_nt_set_int_roundtrip_preserves_type),
-# so assertions use subset checks (set(FIXTURE_NAMES) <= set(result)) rather
-# than equality, and prefix filtering is verified by checking every returned
-# topic matches the prefix.
+@pytest.mark.anyio
+async def test_nt_persistent_subscription(mcp_synced: None) -> None:
+    """Persistent subscriptions can be started, polled, and stopped."""
+    start = await nt_mcp_server.nt_start_subscription(["/SmartDashboard/"])
+    assert start["connected"] is True
+    assert start["started"] is True
+    sub_id = start["subscription_id"]
+
+    # Give the background task a moment to collect the immediate values.
+    await asyncio.sleep(0.5)
+
+    poll = nt_mcp_server.nt_poll_subscription(sub_id)
+    assert poll["connected"] is True
+    assert "/SmartDashboard/test_num" in poll["samples"]
+
+    stop = await nt_mcp_server.nt_stop_subscription(sub_id)
+    assert stop["connected"] is True
+    assert stop["stopped"] is True
+
+    missing = nt_mcp_server.nt_poll_subscription(sub_id)
+    assert "error" in missing
+
+
+# --- Offline MCP tool tests -------------------------------------------------
 
 
 @pytest.mark.anyio
@@ -232,7 +328,7 @@ async def test_nt_list_recordings_returns_metadata(
     assert isinstance(result, list)
     assert len(result) >= 1
     for entry in result:
-        assert {"id", "path", "size_bytes", "modified"} <= set(entry)
+        assert {"id", "path", "size_bytes", "modified", "modified_iso"} <= set(entry)
     json.dumps(result)
 
 
@@ -256,6 +352,43 @@ async def test_nt_get_history_returns_events(mcp_synced: None, tmp_path) -> None
         assert isinstance(entry["time"], float)
     assert any(entry["value"] == 42.0 for entry in result)
     json.dumps(result)
+
+
+@pytest.mark.anyio
+async def test_nt_get_history_summary(mcp_synced: None, tmp_path) -> None:
+    """Given a recording, nt_get_history with format=summary returns stats."""
+    recorder = nt_recorder.Recorder(
+        nt_mcp_server.manager,
+        output_dir=str(tmp_path),
+        prefixes=["/SmartDashboard/"],
+        duration=1.0,
+    )
+    await recorder.run()
+    result = nt_mcp_server.nt_get_history(
+        "/SmartDashboard/test_num", output_dir=str(tmp_path), format="summary"
+    )
+    assert isinstance(result, dict)
+    assert result["count"] >= 1
+    assert result["last_value"] == 42.0
+    assert "min" in result
+
+
+@pytest.mark.anyio
+async def test_nt_get_recording_info(mcp_synced: None, tmp_path) -> None:
+    """Given a recording, nt_get_recording_info returns metadata."""
+    recorder = nt_recorder.Recorder(
+        nt_mcp_server.manager,
+        output_dir=str(tmp_path),
+        prefixes=["/SmartDashboard/"],
+        duration=1.0,
+    )
+    await recorder.run()
+    info = nt_mcp_server.nt_get_recording_info(output_dir=str(tmp_path))
+    assert "error" not in info
+    assert info["total_samples"] >= len(FIXTURE_NAMES)
+    assert info["topic_count"] >= len(FIXTURE_NAMES)
+    assert info["duration_seconds"] >= 0.0
+    assert "modified_iso" in info
 
 
 @pytest.mark.anyio
@@ -308,6 +441,28 @@ async def test_nt_subscribe_offline_returns_dict(
         == {}
     )
     json.dumps(result)
+
+
+@pytest.mark.anyio
+async def test_nt_subscribe_offline_summary(
+    mcp_synced: None, tmp_path
+) -> None:
+    """subscribe_offline with format=summary returns per-topic summaries."""
+    recorder = nt_recorder.Recorder(
+        nt_mcp_server.manager,
+        output_dir=str(tmp_path),
+        prefixes=["/SmartDashboard/"],
+        duration=1.0,
+    )
+    await recorder.run()
+    result = nt_mcp_server.nt_subscribe_offline(
+        ["/SmartDashboard/"], output_dir=str(tmp_path), format="summary"
+    )
+    assert isinstance(result, dict)
+    summary = result["/SmartDashboard/test_num"]
+    assert summary["count"] >= 1
+    assert summary["last_value"] == 42.0
+    assert "min" in summary
 
 
 def test_nt_get_history_missing_recording_returns_empty() -> None:

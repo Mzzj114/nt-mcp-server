@@ -112,6 +112,23 @@ async def test_list_topics_prefix_filter(manager: NTManager) -> None:
 
 
 @pytest.mark.anyio
+async def test_list_topics_regex_filter(manager: NTManager) -> None:
+    """Regex filters topic names."""
+    names = await manager.list_topics(regex=r"test_(num|str)$")
+    assert "/SmartDashboard/test_num" in names
+    assert "/SmartDashboard/test_str" in names
+    assert "/SmartDashboard/test_bool" not in names
+
+
+@pytest.mark.anyio
+async def test_list_topics_wildcard_filter(manager: NTManager) -> None:
+    """Shell-style wildcards filter topic names."""
+    names = await manager.list_topics(wildcard="/SmartDashboard/test_*")
+    assert set(FIXTURE_NAMES) <= set(names)
+    assert await manager.list_topics(wildcard="/SmartDashboard/*.does.not.match") == []
+
+
+@pytest.mark.anyio
 async def test_get_returns_bare_typed_values(manager: NTManager) -> None:
     """get() returns raw values, never metadata wrappers."""
     num = await manager.get("/SmartDashboard/test_num")
@@ -143,7 +160,8 @@ async def test_get_multiple_flat_dict_with_none(manager: NTManager) -> None:
 
 @pytest.mark.anyio
 async def test_set_integer_roundtrip_preserves_int(manager: NTManager) -> None:
-    assert manager.set("/SmartDashboard/client_int", 7) is True
+    res = manager.set("/SmartDashboard/client_int", 7)
+    assert res == {"ok": True, "warning": None}
     value = await manager.get("/SmartDashboard/client_int")
     assert value == 7
     assert type(value) is int
@@ -151,7 +169,8 @@ async def test_set_integer_roundtrip_preserves_int(manager: NTManager) -> None:
 
 @pytest.mark.anyio
 async def test_set_double_roundtrip_preserves_float(manager: NTManager) -> None:
-    assert manager.set("/SmartDashboard/client_double", 2.5) is True
+    res = manager.set("/SmartDashboard/client_double", 2.5)
+    assert res == {"ok": True, "warning": None}
     value = await manager.get("/SmartDashboard/client_double")
     assert value == 2.5
     assert type(value) is float
@@ -159,7 +178,8 @@ async def test_set_double_roundtrip_preserves_float(manager: NTManager) -> None:
 
 @pytest.mark.anyio
 async def test_set_boolean_roundtrip_preserves_bool(manager: NTManager) -> None:
-    assert manager.set("/SmartDashboard/client_bool", False) is True
+    res = manager.set("/SmartDashboard/client_bool", False)
+    assert res == {"ok": True, "warning": None}
     value = await manager.get("/SmartDashboard/client_bool")
     assert value is False
     assert type(value) is bool
@@ -167,27 +187,54 @@ async def test_set_boolean_roundtrip_preserves_bool(manager: NTManager) -> None:
 
 @pytest.mark.anyio
 async def test_set_string_roundtrip(manager: NTManager) -> None:
-    assert manager.set("/SmartDashboard/client_str", "hello") is True
+    res = manager.set("/SmartDashboard/client_str", "hello")
+    assert res == {"ok": True, "warning": None}
     assert await manager.get("/SmartDashboard/client_str") == "hello"
 
 
 @pytest.mark.anyio
 async def test_set_integer_array_roundtrip(manager: NTManager) -> None:
-    assert manager.set("/SmartDashboard/client_iarr", [4, 5, 6]) is True
+    res = manager.set("/SmartDashboard/client_iarr", [4, 5, 6])
+    assert res == {"ok": True, "warning": None}
     assert await manager.get("/SmartDashboard/client_iarr") == [4, 5, 6]
 
 
 @pytest.mark.anyio
 async def test_set_double_array_roundtrip(manager: NTManager) -> None:
-    assert manager.set("/SmartDashboard/client_darr", [0.5, 1.5]) is True
+    res = manager.set("/SmartDashboard/client_darr", [0.5, 1.5])
+    assert res == {"ok": True, "warning": None}
     assert await manager.get("/SmartDashboard/client_darr") == [0.5, 1.5]
 
 
 @pytest.mark.anyio
 async def test_set_invalid_type_returns_false(manager: NTManager) -> None:
-    """set() on unsupported types returns False without raising."""
-    assert manager.set("/SmartDashboard/client_bad", {"not": "a scalar"}) is False
-    assert manager.set("/SmartDashboard/client_mixed", [1, "two"]) is False
+    """set() on unsupported types returns ok=False without raising."""
+    assert manager.set("/SmartDashboard/client_bad", {"not": "a scalar"}) == {
+        "ok": False,
+        "warning": None,
+    }
+    assert manager.set("/SmartDashboard/client_mixed", [1, "two"]) == {
+        "ok": False,
+        "warning": None,
+    }
+
+
+@pytest.mark.anyio
+async def test_set_type_warning_for_known_topic(manager: NTManager) -> None:
+    """Writing the wrong type to a known topic produces a warning."""
+    manager.set("/SmartDashboard/warn_num", 1.0)
+    res = manager.set("/SmartDashboard/warn_num", "not a number")
+    assert res["warning"] is not None
+    assert "expected double" in res["warning"]
+
+
+@pytest.mark.anyio
+async def test_set_strict_type_check_refuses_mismatch(manager: NTManager) -> None:
+    """strict_type_check=True refuses mismatched writes."""
+    manager.set("/SmartDashboard/strict_num", 1.0)
+    res = manager.set("/SmartDashboard/strict_num", "not a number", strict_type_check=True)
+    assert res["ok"] is False
+    assert res["warning"] is not None
 
 
 @pytest.mark.anyio
@@ -203,6 +250,19 @@ async def test_subscribe_samples_every_fixture_topic(manager: NTManager) -> None
             assert isinstance(event["time"], float)
         if name in FIXTURE_VALUES:
             assert any(event["value"] == FIXTURE_VALUES[name] for event in events)
+
+
+@pytest.mark.anyio
+async def test_subscribe_summary_format(manager: NTManager) -> None:
+    """format='summary' reduces per-topic samples to min/max/mean/last."""
+    summary = await manager.subscribe(["/SmartDashboard/"], duration=1.0, format="summary")
+    assert "/SmartDashboard/test_num" in summary
+    num_summary = summary["/SmartDashboard/test_num"]
+    assert num_summary["count"] >= 1
+    assert num_summary["last_value"] == 42.0
+    assert "min" in num_summary
+    assert "max" in num_summary
+    assert "mean" in num_summary
 
 
 @pytest.mark.anyio
@@ -244,8 +304,8 @@ async def test_subscribe_stream_all_topics(manager: NTManager) -> None:
 
     Validates that the default recording prefix captures all topics that
     list_topics() reports. Consumes the generator for 1.0s via
-    ``asyncio.timeout`` (the generator only yields on value updates, so a
-    bare ``time.monotonic`` check inside the ``async for`` would never
+    ``asyncio.timeout`` (the generator only yields on value updates, so
+    a bare ``time.monotonic`` check inside the ``async for`` would never
     fire between events).
     """
     topics_seen: set[str] = set()

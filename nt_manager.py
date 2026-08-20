@@ -8,13 +8,15 @@ control the client lifecycle and read connection state.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
+import re
 import time
 from collections.abc import AsyncIterator
 from typing import Any
 
 import ntcore
 
-from nt_types import array_kind, to_jsonable
+from nt_types import array_kind, summarize, to_jsonable, type_warning
 
 try:  # assert_never: typing on 3.11+, typing_extensions on 3.10
     from typing import assert_never
@@ -133,15 +135,28 @@ class NTManager:
         }
         return to_jsonable(info)
 
-    async def list_topics(self, prefix: str | None = None) -> list[str]:
-        """Return the names of all topics, optionally filtered by prefix.
+    def is_connected(self) -> bool:
+        """Return whether the NT4 client currently has a server connection."""
+        return self._instance().isConnected()
 
-        Uses ``NetworkTableInstance.getTopicInfo()`` and applies the
-        ``startswith`` filter in Python so a ``None`` prefix returns every
-        topic. A topics-only subscription on ``"/"`` is kept so server
-        announcements populate the topic store; the first call after
-        connect waits briefly — yielding via ``await asyncio.sleep`` — for
-        the initial announcements to arrive.
+    async def list_topics(
+        self,
+        prefix: str | None = None,
+        regex: str | None = None,
+        wildcard: str | None = None,
+    ) -> list[str]:
+        """Return the names of all topics, optionally filtered.
+
+        ``prefix`` matches ``topic.startswith(prefix)``. ``regex`` matches
+        the full topic name against the provided pattern. ``wildcard`` uses
+        shell-style globbing via :func:`fnmatch.fnmatch`. All filters are
+        applied together when more than one is supplied.
+
+        Uses ``NetworkTableInstance.getTopicInfo()`` and applies the filters
+        in Python. A topics-only subscription on ``"/"`` is kept so server
+        announcements populate the topic store; the first call after connect
+        waits briefly — yielding via ``await asyncio.sleep`` — for the
+        initial announcements to arrive.
         """
         inst = self._instance()
         if self._client_running:
@@ -154,9 +169,15 @@ class NTManager:
                     await asyncio.sleep(0.01)
                 self._topics_synced = True
         infos = inst.getTopicInfo()
-        if prefix is None:
-            return [info.name for info in infos]
-        return [info.name for info in infos if info.name.startswith(prefix)]
+        names = [info.name for info in infos]
+        if prefix is not None:
+            names = [name for name in names if name.startswith(prefix)]
+        if regex is not None:
+            pattern = re.compile(regex)
+            names = [name for name in names if pattern.search(name)]
+        if wildcard is not None:
+            names = [name for name in names if fnmatch.fnmatch(name, wildcard)]
+        return names
 
     async def get(self, topic: str) -> Any:
         """Return the JSON-normalized value of ``topic`` or ``None``.
@@ -217,42 +238,76 @@ class NTManager:
                 }
         return None
 
-    def set(self, topic: str, value: Any) -> bool:
-        """Publish ``value`` to ``topic``; return the setter's bool result.
+    def _topic_type_str(self, topic: str) -> str | None:
+        """Return the published type string for ``topic``, or ``None``."""
+        for info in self._instance().getTopicInfo():
+            if info.name == topic:
+                return info.type_str
+        return None
+
+    def set(
+        self, topic: str, value: Any, strict_type_check: bool = False
+    ) -> dict[str, Any]:
+        """Publish ``value`` to ``topic``.
+
+        Returns ``{"ok": bool, "warning": str | None}``. If the topic is
+        already published with a known type and ``value`` does not match,
+        a warning is returned. When ``strict_type_check`` is ``True`` the
+        write is refused and ``ok`` is ``False``; otherwise the write is
+        still attempted.
 
         Dispatches on the Python type — bool checked before int — to the
         matching entry setter; homogeneous lists use the array setters.
-        Unsupported or mixed types return ``False`` without raising.
+        Unsupported or mixed types set ``ok`` to ``False``.
         """
-        entry = self._instance().getEntry(topic)
-        if isinstance(value, bool):
-            return entry.setBoolean(value)
-        if isinstance(value, int):
-            return entry.setInteger(value)
-        if isinstance(value, float):
-            return entry.setDouble(value)
-        if isinstance(value, str):
-            return entry.setString(value)
-        if isinstance(value, list):
-            kind = array_kind(value)
-            if kind is None:
-                return False
-            match kind:
-                case "boolean":
-                    return entry.setBooleanArray(value)
-                case "integer":
-                    return entry.setIntegerArray(value)
-                case "double":
-                    return entry.setDoubleArray(value)
-                case "string":
-                    return entry.setStringArray(value)
-                case unreachable:
-                    assert_never(unreachable)
-        return False
+        warning: str | None = None
+        type_str = self._topic_type_str(topic)
+        if type_str is not None:
+            warning = type_warning(value, type_str)
+            if warning and strict_type_check:
+                return {"ok": False, "warning": warning}
 
-    def set_multiple(self, updates: dict[str, Any]) -> dict[str, bool]:
-        """Write every ``{topic: value}`` pair; return per-topic results."""
-        return {topic: self.set(topic, value) for topic, value in updates.items()}
+        entry = self._instance().getEntry(topic)
+        ok = False
+        if isinstance(value, bool):
+            ok = entry.setBoolean(value)
+        elif isinstance(value, int):
+            ok = entry.setInteger(value)
+        elif isinstance(value, float):
+            ok = entry.setDouble(value)
+        elif isinstance(value, str):
+            ok = entry.setString(value)
+        elif isinstance(value, list):
+            kind = array_kind(value)
+            if kind is not None:
+                match kind:
+                    case "boolean":
+                        ok = entry.setBooleanArray(value)
+                    case "integer":
+                        ok = entry.setIntegerArray(value)
+                    case "double":
+                        ok = entry.setDoubleArray(value)
+                    case "string":
+                        ok = entry.setStringArray(value)
+                    case unreachable:
+                        assert_never(unreachable)
+        return {"ok": ok, "warning": warning}
+
+    def set_multiple(
+        self, updates: dict[str, Any], strict_type_check: bool = False
+    ) -> dict[str, Any]:
+        """Write every ``{topic: value}`` pair.
+
+        Returns ``{"results": {topic: bool}, "warnings": {topic: str | None}}``.
+        ``strict_type_check`` is applied per-topic.
+        """
+        results: dict[str, bool] = {}
+        warnings: dict[str, str | None] = {}
+        for topic, value in updates.items():
+            res = self.set(topic, value, strict_type_check=strict_type_check)
+            results[topic] = res["ok"]
+            warnings[topic] = res["warning"]
+        return {"results": results, "warnings": warnings}
 
     async def subscribe_stream(
         self, prefixes: list[str]
@@ -289,27 +344,55 @@ class NTManager:
             poller.close()
 
     async def subscribe(
-        self, prefixes: list[str], duration: float = 10.0
-    ) -> dict[str, list[dict]]:
-        """Sample every value update under ``prefixes`` for ``duration`` s.
+        self,
+        prefixes: list[str],
+        duration: float = 10.0,
+        sample_interval: float | None = None,
+        change_only: float | None = None,
+        format: str = "samples",
+    ) -> dict[str, Any]:
+        """Sample value updates under ``prefixes`` for ``duration`` s.
 
-        Returns ``{topic: [{"time": float_s, "value": jsonable}, ...]}``.
-        ``kImmediate`` emits the current value once per topic, then
-        ``kValueAll`` on every change. Disconnect or no published topics
-        yield ``{}``; subscriber and poller are always closed (via
-        ``subscribe_stream``'s ``finally``).
+        Returns ``{topic: samples | summary}``. Each sample is
+        ``{"time": float_s, "value": jsonable}``. ``sample_interval``
+        decimates to at most one sample per topic per interval (using the
+        event timestamp). ``change_only`` skips samples whose numeric value
+        changed by ``<= change_only``; non-numeric values are skipped only
+        when unchanged. ``format="summary"`` replaces each topic's sample
+        list with ``{"count", "last_value", "last_time", "min", "max",
+        "mean"}``.
 
-        ``asyncio.timeout`` enforces the deadline when no events flow
-        (the generator only yields on value updates, so a bare
-        ``time.monotonic`` check inside the ``async for`` would never
-        fire between events). The monotonic check still provides an
-        early exit when events are flowing past the deadline.
+        ``asyncio.timeout`` enforces the deadline when no events flow; the
+        monotonic check provides an early exit when events flow past the
+        deadline.
         """
         results: dict[str, list[dict]] = {}
         end = time.monotonic() + duration
+        last_time: dict[str, float] = {}
+        last_value: dict[str, Any] = {}
+        sentinel = object()
         try:
             async with asyncio.timeout(duration):
                 async for topic, value, time_seconds in self.subscribe_stream(prefixes):
+                    if sample_interval is not None:
+                        if time_seconds - last_time.get(topic, -sample_interval) < sample_interval:
+                            continue
+                        last_time[topic] = time_seconds
+                    if change_only is not None:
+                        prev = last_value.get(topic, sentinel)
+                        if prev is not sentinel:
+                            if isinstance(value, (int, float)) and isinstance(
+                                prev, (int, float)
+                            ):
+                                if (
+                                    not isinstance(value, bool)
+                                    and not isinstance(prev, bool)
+                                    and abs(value - prev) <= change_only
+                                ):
+                                    continue
+                            elif value == prev:
+                                continue
+                        last_value[topic] = value
                     results.setdefault(topic, []).append(
                         {"time": time_seconds, "value": value}
                     )
@@ -317,4 +400,6 @@ class NTManager:
                         break
         except TimeoutError:
             pass
+        if format == "summary":
+            return {topic: summarize(samples) for topic, samples in results.items()}
         return results

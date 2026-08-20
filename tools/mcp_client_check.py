@@ -148,7 +148,8 @@ def main() -> int:
         topics_text = _text_of(
             client.call("tools/call", {"name": "nt_list_topics", "arguments": {}})
         )
-        topics = json.loads(topics_text)
+        topics_result = json.loads(topics_text)
+        topics = topics_result.get("topics", []) if isinstance(topics_result, dict) else topics_result
         pose_topics = [t for t in topics if "Swerve/Pose X" in t]
         print(
             f"PASS: nt_list_topics returned {len(topics)} topics; "
@@ -163,11 +164,12 @@ def main() -> int:
                 {"name": "nt_get", "arguments": {"topic": POSE_TOPIC}},
             )
         )
-        value = json.loads(get_text)
+        get_result = json.loads(get_text)
+        value = get_result.get("value") if isinstance(get_result, dict) else get_result
         is_float = isinstance(value, float) and not isinstance(value, bool)
         print(f"{'PASS' if is_float else 'FAIL'}: nt_get({POSE_TOPIC!r}) -> {value!r} (bare float)")
         if not is_float:
-            failures.append(f"nt_get returned {value!r}, expected a bare float")
+            failures.append(f"nt_get returned {get_result!r}, expected a wrapped bare float")
     finally:
         client._send({"jsonrpc": "2.0", "method": "shutdown"})
         try:

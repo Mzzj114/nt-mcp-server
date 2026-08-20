@@ -80,12 +80,12 @@ async def main() -> int:
         )
 
         # A4: set marker and read it back.
-        set_ok = manager.set(MARKER_TOPIC, MARKER_VALUE)
+        set_result = manager.set(MARKER_TOPIC, MARKER_VALUE)
         roundtrip_value = await manager.get(MARKER_TOPIC)
         check(
             "set marker topic and read it back",
-            set_ok and roundtrip_value == MARKER_VALUE,
-            f"set->{set_ok}, get->{roundtrip_value!r} (expected {MARKER_VALUE})",
+            set_result["ok"] and roundtrip_value == MARKER_VALUE,
+            f"set->{set_result}, get->{roundtrip_value!r} (expected {MARKER_VALUE})",
         )
 
         # A5: subscribe samples at least once under /SmartDashboard/.

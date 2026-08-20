@@ -128,6 +128,42 @@ async def test_reader_get_history(manager: NTManager, tmp_path) -> None:
 
 
 @pytest.mark.anyio
+async def test_reader_get_history_summary(manager: NTManager, tmp_path) -> None:
+    """get_history with format=summary returns stats for a topic."""
+    recorder = nt_recorder.Recorder(
+        manager, output_dir=str(tmp_path), prefixes=["/SmartDashboard/"], duration=1.0
+    )
+    await recorder.run()
+    summary = nt_recorder.get_history(
+        "/SmartDashboard/test_num", output_dir=str(tmp_path), format="summary"
+    )
+    assert isinstance(summary, dict)
+    assert summary["count"] >= 1
+    assert summary["last_value"] == 42.0
+    assert "min" in summary
+
+
+@pytest.mark.anyio
+async def test_reader_get_history_last_seconds(manager: NTManager, tmp_path) -> None:
+    """last_seconds filters to the most recent portion of the recording."""
+    recorder = nt_recorder.Recorder(
+        manager, output_dir=str(tmp_path), prefixes=["/SmartDashboard/"], duration=1.0
+    )
+    await recorder.run()
+    full = nt_recorder.get_history(
+        "/SmartDashboard/test_num", output_dir=str(tmp_path)
+    )
+    recent = nt_recorder.get_history(
+        "/SmartDashboard/test_num", output_dir=str(tmp_path), last_seconds=0.1
+    )
+    assert len(recent) <= len(full)
+    if recent:
+        assert all(
+            entry["time"] >= full[-1]["time"] - 0.1 for entry in recent
+        )
+
+
+@pytest.mark.anyio
 async def test_reader_list_topics_with_prefix(
     manager: NTManager, tmp_path
 ) -> None:
@@ -157,6 +193,27 @@ async def test_reader_list_topics_with_prefix(
 
 
 @pytest.mark.anyio
+async def test_reader_list_topics_regex_and_wildcard(
+    manager: NTManager, tmp_path
+) -> None:
+    """Regex and wildcard filters work on offline topic lists."""
+    recorder = nt_recorder.Recorder(
+        manager, output_dir=str(tmp_path), prefixes=["/SmartDashboard/"], duration=1.0
+    )
+    await recorder.run()
+    regex_topics = nt_recorder.list_topics(
+        output_dir=str(tmp_path), regex=r"test_(num|str)$"
+    )
+    assert "/SmartDashboard/test_num" in regex_topics
+    assert "/SmartDashboard/test_bool" not in regex_topics
+
+    wildcard_topics = nt_recorder.list_topics(
+        output_dir=str(tmp_path), wildcard="/SmartDashboard/test_*"
+    )
+    assert set(FIXTURE_NAMES) <= set(wildcard_topics)
+
+
+@pytest.mark.anyio
 async def test_reader_subscribe_offline(
     manager: NTManager, tmp_path
 ) -> None:
@@ -183,6 +240,42 @@ async def test_reader_subscribe_offline(
 
 
 @pytest.mark.anyio
+async def test_reader_subscribe_offline_summary(
+    manager: NTManager, tmp_path
+) -> None:
+    """subscribe_offline with format=summary returns per-topic summaries."""
+    recorder = nt_recorder.Recorder(
+        manager, output_dir=str(tmp_path), prefixes=["/SmartDashboard/"], duration=1.0
+    )
+    await recorder.run()
+    result = nt_recorder.subscribe_offline(
+        ["/SmartDashboard/"], output_dir=str(tmp_path), format="summary"
+    )
+    assert isinstance(result, dict)
+    summary = result["/SmartDashboard/test_num"]
+    assert summary["count"] >= 1
+    assert summary["last_value"] == 42.0
+    assert "min" in summary
+
+
+@pytest.mark.anyio
+async def test_reader_get_recording_info(
+    manager: NTManager, tmp_path
+) -> None:
+    """get_recording_info returns duration, sample count and topic count."""
+    recorder = nt_recorder.Recorder(
+        manager, output_dir=str(tmp_path), prefixes=["/SmartDashboard/"], duration=1.0
+    )
+    await recorder.run()
+    info = nt_recorder.get_recording_info(output_dir=str(tmp_path))
+    assert "error" not in info
+    assert info["total_samples"] >= len(FIXTURE_NAMES)
+    assert info["topic_count"] >= len(FIXTURE_NAMES)
+    assert info["duration_seconds"] >= 0.0
+    assert "modified_iso" in info
+
+
+@pytest.mark.anyio
 async def test_reader_list_recordings_and_most_recent_default(
     manager: NTManager, tmp_path
 ) -> None:
@@ -194,7 +287,7 @@ async def test_reader_list_recordings_and_most_recent_default(
     recordings = nt_recorder.list_recordings(output_dir=str(tmp_path))
     assert len(recordings) >= 1
     for entry in recordings:
-        assert {"id", "path", "size_bytes", "modified"} <= set(entry)
+        assert {"id", "path", "size_bytes", "modified", "modified_iso"} <= set(entry)
     history = nt_recorder.get_history(
         "/SmartDashboard/test_num", output_dir=str(tmp_path)
     )
@@ -219,3 +312,7 @@ def test_reader_missing_recording_returns_empty() -> None:
         nt_recorder.list_topics(recording_id="nonexistent.ndjson", output_dir=".")
         == []
     )
+    info = nt_recorder.get_recording_info(
+        recording_id="nonexistent.ndjson", output_dir="."
+    )
+    assert "error" in info
