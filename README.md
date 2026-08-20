@@ -98,13 +98,3 @@ Verify with `opencode mcp list` from the project root: the `nt` server should sh
 
 - Python 3.14.0 venv in `.venv`; deps installed from `requirements.txt` (`fastmcp==3.4.7`, `pyntcore==2026.2.2`).
 - Tests: `.venv\Scripts\python.exe -m pytest tests/ -v`
-
-## Acceptance checklist
-
-- [ ] Standalone git repo with its own venv; `import fastmcp, ntcore` works.
-- [ ] All pytest suites green: loopback NT4 tests + tool-level tests (JSON-serializable, raw-value contract).
-- [ ] E2E against `python -m robotpy sim --nogui` passes: connect / list / get / set / subscribe against `127.0.0.1:5810` (with the sim-alive pre-check).
-- [ ] `opencode mcp` lists and starts the `nt` server; a tool call through it returns a bare value.
-- [ ] `try-robotpy` is byte-for-byte untouched (`git status` clean there); nothing new reaches the roboRIO deploy surface.
-- [ ] README documents run commands, registration snippet, tool table, and acceptance checklist.
-- [ ] Final verification wave (F1-F4) all approve.

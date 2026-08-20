@@ -2,3 +2,9 @@ For real robot, try to use a ethernet cable to connect to radio so that your wir
 This is crucial if you want to let AI access Network Table synchronously.
 
 `python -m robotpy deploy` doesn't need DS. connect dev laptop and test laptop(with DS) at the same time, and one for deploy, the other for running
+
+todo
+- resolve found issue
+- Sim control hooks: if the MCP could publish joystick axes or trigger enable/disable, it could drive the sim autonomously for tests.
+- usage of this mcp needs instructions. See whether put it in the mcp or in the skill
+- the mcp will be shared, so find a way to package it

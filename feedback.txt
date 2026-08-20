@@ -1,0 +1,31 @@
+# Online Tools
+
+What works well
+- Core NT operations are solid: connect, list, get, set, subscribe, batch set/get.
+- subscribe returning timestamped history is the standout feature — great for catching brief spikes or tracking drift.
+- get_info exposes type and properties, which is essential when you want to know whether a topic is a number, string, array, or a widget like Field2d.
+- Batch APIs (get_multiple, set_multiple) make scripting much less chatty.
+Real bugs / rough edges
+1. Disconnection handling. When you closed the sim earlier, nt_nt_get_info returned an outputSchema validation error and subscribe returned {}. A clean {"connected": false, "error": "NT server disconnected"}-style response would be far less confusing. Likewise, other tools may surface disconnects in tool responses.
+
+Improvements that would make it more powerful
+- Topic filtering / search: list_topics with a regex or wildcard beyond simple prefix would help large robots.
+- Typed write guard: refuse or warn when set sends the wrong type for a known topic.
+- Connection health in every response: include a small connected flag so callers do not need a separate connection_info check.
+
+For nt_nt_subscribe
+- Add a sample_interval / decimation parameter. Let the user ask for “one sample every 250 ms” instead of the implicit server loop rate, which cuts volume without losing slow trends.
+- Add a change_only filter. Only return samples where the value changed by more than a threshold. For the spinning theta this still returns many points, but for mostly-static values like pose X/Y it collapses to almost nothing.
+- Return summaries instead of raw arrays. An option like format: "summary" could yield min/max/mean/last over the window, which is enough for many diagnostics.
+- Split into “start subscription” + “poll samples” tools. Instead of one blocking call that hoards data, the MCP could open a persistent subscription and let the caller ask for the latest batch whenever they want. That keeps each response small and fits the chat turn model better.
+
+# Offline Tools
+Good
+- The offline API mirrors the live API, so it is easy to switch between “watch live” and “inspect log.”
+- It successfully captured the MCP-written test values, which proves writes are recorded too.
+- limit on subscribe_offline is essential and already works.
+Improvements
+1. Time-range filters. get_history and subscribe_offline only support limit and start/end, but there is no easy way to say “last 5 seconds” or “from timestamp T to T+2.” Adding relative-time offsets would make post-match analysis much faster.
+2. Same token concern as live subscribe. subscribe_offline dumps raw samples. For long recordings, a sample_interval or summary mode would prevent huge responses.
+3. Recording metadata. There is no tool to get duration, total sample count, or topic list size without scanning the file. A get_recording_info call would be useful.
+4. Human-readable timestamps. The modified field in list_recordings is a Unix float; formatting it as ISO-8601 would help identify recordings.
