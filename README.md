@@ -127,3 +127,6 @@ Verify with `opencode mcp list` from the project root: the `nt` server should sh
 
 - Python 3.14.0 venv in `.venv`; deps installed from `requirements.txt` (`fastmcp==3.4.7`, `pyntcore==2026.2.2`).
 - Tests: `uv run pytest tests/ -v`
+
+## License
+This project is under MIT License.
