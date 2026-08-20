@@ -2,11 +2,7 @@
 
 A standalone MCP server for reading, writing, and monitoring FRC NetworkTables data. It lets an AI agent talk to a robot's network tables over the NetworkTables protocol. The primary target is the local RobotPy sim (`python -m robotpy sim` on `127.0.0.1:5810`).
 
-This project lives as a sibling to `try-robotpy` and never touches it. It has its own venv and pinned dependencies (`fastmcp==3.4.7`, `pyntcore==2026.2.2`).
-
-## try-robotpy untouched
-
-`nt-mcp-server` is a sibling project to `try-robotpy` (both live side-by-side in the same parent directory), and nothing is added to the robot repo. The server has its own venv, its own pinned dependencies, and its own git history. `try-robotpy`'s `git status` stays clean, so nothing new can reach the roboRIO deploy surface. The only interaction is the sim process itself, which the server connects to over NT4 at `127.0.0.1:5810`.
+pinned dependencies (`fastmcp==3.4.7`, `pyntcore==2026.2.2`).
 
 ## Run the server
 
@@ -22,7 +18,7 @@ python -m nt_mcp_server
 
 The server runs on stdio, which is how MCP clients (like opencode) talk to it.
 
-## Run the RobotPy sim
+## Connect to RobotPy sim NetworkTables
 
 The sim must be running before the server can read or write anything useful. Start it from its own project and venv:
 
@@ -31,6 +27,12 @@ cd <path-to-try-robotpy> && .venv\Scripts\activate && python -m robotpy sim
 ```
 
 The server connects to `127.0.0.1:5810` by default, which is where the sim listens.
+
+## Connect to Real Robot NetworkTables
+
+For most cases, just record NetworkTables and use the mcp to analyze the recordings.
+
+If you want to connect to a real robot's NetworkTables in real time, you need to have 2 network adapters on you device: one for Internet and the other for robot communication. One approach is to use your wireless adapter to connect to the wifi and use a ethernet cable to connect to the robot. Alternatively, you get a USB Network Adapter as the second adapter. In ethier cases, you may need to configure your device's network routing.
 
 ## Record NetworkTables to NDJSON (offline)
 
@@ -53,7 +55,7 @@ Output files are named `nt-record-<YYYY-MM-DDTHHMMSSZ>.ndjson` (no colons, Windo
 
 ## Tools
 
-The server exposes 17 tools (13 live + 4 offline). Every live tool response includes a `connected` flag. If the NT server is disconnected, live tools return `{"connected": false, "error": "NT server disconnected"}` instead of empty or schema-invalid output.
+The server exposes 17 tools (13 live + 4 offline). Every live tool response includes a `connected` flag.
 
 ### Live tools
 
@@ -90,17 +92,17 @@ The offline tools read from the directory set by the `NT_RECORDINGS_DIR` environ
 The server is a uvx-runnable package from git, so any MCP client can launch it without a local checkout or a pre-built venv. Run it on demand:
 
 ```powershell
-uvx --from git+https://github.com/<your-repo>/nt-mcp-server.git nt-mcp-server
+uvx --from git+https://github.com/Mzzj114/nt-mcp-server.git nt-mcp-server
 ```
 
 Or install the console script once and run it anywhere:
 
 ```powershell
-uv tool install "git+https://github.com/<your-repo>/nt-mcp-server.git"
+uv tool install "git+https://github.com/Mzzj114/nt-mcp-server.git"
 uvx nt-mcp-server
 ```
 
-Add this entry to your agent's MCP config (shown here as opencode's project-level `opencode.jsonc` at the repo root):
+Add this entry to your agent's MCP config (shown here as opencode's project-level `opencode.jsonc`):
 
 ```jsonc
 {
@@ -110,7 +112,7 @@ Add this entry to your agent's MCP config (shown here as opencode's project-leve
       "command": [
         "uvx",
         "--from",
-        "git+https://github.com/<your-repo>/nt-mcp-server.git",
+        "git+https://github.com/Mzzj114/nt-mcp-server.git",
         "nt-mcp-server"
       ],
       "enabled": true
