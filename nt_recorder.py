@@ -188,10 +188,17 @@ def _iter_timed_events(path: str) -> Iterator[tuple[float, dict]]:
 
 
 def _time_bounds(path: str) -> tuple[float, float] | None:
-    """Return ``(min_time, max_time)`` across all valid events, or ``None``."""
+    """Return ``(min_time, max_time)`` across all valid events, or ``None``.
+
+    Zero or negative timestamps are ignored. NT's ``last_change()`` can
+    return 0 for kImmediate/initial values, which would otherwise collapse
+    the duration to the absolute end timestamp.
+    """
     min_time: float | None = None
     max_time: float | None = None
     for t, _ in _iter_timed_events(path):
+        if t <= 0:
+            continue
         if min_time is None or t < min_time:
             min_time = t
         if max_time is None or t > max_time:

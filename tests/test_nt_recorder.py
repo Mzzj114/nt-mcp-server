@@ -275,6 +275,19 @@ async def test_reader_get_recording_info(
     assert "modified_iso" in info
 
 
+def test_reader_get_recording_info_ignores_zero_timestamps(tmp_path) -> None:
+    """Zero/negative timestamps from kImmediate values must not corrupt duration."""
+    recording = tmp_path / "zero-time.ndjson"
+    with open(recording, "w", encoding="utf-8") as file:
+        file.write(json.dumps({"time": 0, "topic": "/x", "value": 1}) + "\n")
+        file.write(json.dumps({"time": 1000.0, "topic": "/x", "value": 2}) + "\n")
+        file.write(json.dumps({"time": 1017.5, "topic": "/x", "value": 3}) + "\n")
+    info = nt_recorder.get_recording_info(recording_id=recording.name, output_dir=str(tmp_path))
+    assert info["duration_seconds"] == pytest.approx(17.5, abs=0.01)
+    assert info["total_samples"] == 3
+    assert info["topic_count"] == 1
+
+
 @pytest.mark.anyio
 async def test_reader_list_recordings_and_most_recent_default(
     manager: NTManager, tmp_path
