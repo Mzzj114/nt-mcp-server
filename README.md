@@ -34,6 +34,42 @@ For most cases, just record NetworkTables and use the mcp to analyze the recordi
 
 If you want to connect to a real robot's NetworkTables in real time, you need to have 2 network adapters on you device: one for Internet and the other for robot communication. One approach is to use your wireless adapter to connect to the wifi and use a ethernet cable to connect to the robot. Alternatively, you get a USB Network Adapter as the second adapter. In ethier cases, you may need to configure your device's network routing.
 
+## Register in any agent
+
+The server is a uvx-runnable package from git, so any MCP client can launch it without a local checkout or a pre-built venv. Run it on demand:
+
+```powershell
+uvx --from git+https://github.com/Mzzj114/nt-mcp-server.git nt-mcp-server
+```
+
+Or install the console script once and run it anywhere:
+
+```powershell
+uv tool install "git+https://github.com/Mzzj114/nt-mcp-server.git"
+uvx nt-mcp-server
+```
+
+Add this entry to your agent's MCP config (shown here as opencode's project-level `opencode.jsonc`):
+
+```json
+{
+  "mcp": {
+    "nt": {
+      "type": "local",
+      "command": [
+        "uvx",
+        "--from",
+        "git+https://github.com/Mzzj114/nt-mcp-server.git",
+        "nt-mcp-server"
+      ],
+      "enabled": true
+    }
+  }
+}
+```
+
+Verify with `opencode mcp list` from the project root: the `nt` server should show as connected.
+
 ## Record NetworkTables to NDJSON (offline)
 
 The `nt-recorder` CLI connects to a live NT4 server and writes value events to a timestamped `.ndjson` file. It runs on the dev laptop and reads NT from the sim or robot; no robot-side changes are needed.
@@ -41,6 +77,21 @@ The `nt-recorder` CLI connects to a live NT4 server and writes value events to a
 ```powershell
 uv run nt-recorder --prefixes /SmartDashboard/ --output-dir recordings
 ```
+
+Or, with no local checkout, run it straight from git via uvx (same source as the server):
+
+```powershell
+uvx --from git+https://github.com/Mzzj114/nt-mcp-server.git nt-recorder --prefixes /SmartDashboard/ --output-dir recordings
+```
+
+Or install the tool once so both `nt-mcp-server` and `nt-recorder` are on PATH, then run either without re-fetching:
+
+```powershell
+uv tool install "git+https://github.com/Mzzj114/nt-mcp-server.git"
+nt-recorder --prefixes /SmartDashboard/ --output-dir recordings
+```
+
+The recorder is a standalone console script, independent of the MCP server — running the server via uvx does not start it, and the agent does not need to be connected to record.
 
 Options:
 - `--prefixes` — topic prefixes to subscribe to (default: `/`)
@@ -52,6 +103,8 @@ Options:
 - `--quiet` — suppress status output to stderr
 
 Output files are named `nt-record-<YYYY-MM-DDTHHMMSSZ>.ndjson` (no colons, Windows-safe). Each line is `{"time": float, "topic": str, "value": jsonable}`. Exit codes: 0 clean, 1 connection failure, 2 disk/IO error.
+
+> Run `uv cache prune` or `uv cache clear` if you don't want cache files to stay on your device after `uvx`.
 
 ## Tools
 
@@ -86,42 +139,6 @@ The server exposes 17 tools (13 live + 4 offline). Every live tool response incl
 | `nt_subscribe_offline` | Return events for every topic under prefixes. Supports `last_seconds`, `sample_interval`, and `format="summary"`. |
 
 The offline tools read from the directory set by the `NT_RECORDINGS_DIR` environment variable (defaults to `./recordings`). Recordings are local-only — the recorder runs on the dev laptop and reads NT from the sim/robot; no robot-side changes are needed.
-
-## Register in any agent
-
-The server is a uvx-runnable package from git, so any MCP client can launch it without a local checkout or a pre-built venv. Run it on demand:
-
-```powershell
-uvx --from git+https://github.com/Mzzj114/nt-mcp-server.git nt-mcp-server
-```
-
-Or install the console script once and run it anywhere:
-
-```powershell
-uv tool install "git+https://github.com/Mzzj114/nt-mcp-server.git"
-uvx nt-mcp-server
-```
-
-Add this entry to your agent's MCP config (shown here as opencode's project-level `opencode.jsonc`):
-
-```jsonc
-{
-  "mcp": {
-    "nt": {
-      "type": "local",
-      "command": [
-        "uvx",
-        "--from",
-        "git+https://github.com/Mzzj114/nt-mcp-server.git",
-        "nt-mcp-server"
-      ],
-      "enabled": true
-    }
-  }
-}
-```
-
-Verify with `opencode mcp list` from the project root: the `nt` server should show as connected.
 
 ## Development
 
