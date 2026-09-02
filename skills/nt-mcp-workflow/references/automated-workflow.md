@@ -24,7 +24,7 @@ If the existing telemetry is not enough to observe or control the behavior you a
       -WorkingDirectory "D:\Program\Hardware\try-robotpy"
   ```
 
-- **Real robot**: The user must connect the cable or Wi-Fi so you can reach the roboRIO. Confirm the team number or IP before connecting.
+- **Real robot**: The user must connect the cable or Wi-Fi so you can reach the roboRIO, while a second adapter keeps the internet connection — see `references/network-setup.md` for the two-adapter setup and static routing. Confirm the team number or IP before connecting.
 
 Wait a few seconds for the robot/sim to boot, then proceed with the chosen workflow reference.
 

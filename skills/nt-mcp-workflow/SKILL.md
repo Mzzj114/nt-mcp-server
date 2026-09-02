@@ -26,3 +26,5 @@ Investigate an FRC robot issue using the `nt` (NetworkTables) MCP server. The se
 
 If neither mode is a perfect fit, use whichever tools best answer the user's question.
 
+Connecting live to a **real robot** (rather than the sim) requires a two-adapter network setup with static routing — see `references/network-setup.md`.
+
