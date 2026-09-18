@@ -70,6 +70,22 @@ Add this entry to your agent's MCP config (shown here as opencode's project-leve
 
 Verify with `opencode mcp list` from the project root: the `nt` server should show as connected.
 
+### Load the nt-mcp-workflow skill
+
+The repo ships an agent skill at `skills/nt-mcp-workflow/` that teaches an agent how to run a NetworkTables investigation (live, offline replay, and recording). opencode does **not** scan a project-local `.agents/skills` directory — it only auto-loads `~/.agents/skills`, `~/.claude/skills`, project `.opencode/skill(s)/`, and directories listed under explicit `skills.paths`. Add this block to your `opencode.jsonc` (same file as the `mcp` entry above):
+
+```json
+{
+  "skills": {
+    "paths": ["../nt-mcp-server/skills"]
+  }
+}
+```
+
+The relative path resolves against the directory containing the config file, so adjust it to wherever your checkout of this repo sits relative to that config. opencode scans `skills.paths` recursively for `**/SKILL.md`, so pointing at the repo's `skills` directory exposes `nt-mcp-workflow`.
+
+> opencode loads its config once at startup and does **not** hot-reload — restart opencode after editing the config for the skill to appear.
+
 ## Record NetworkTables to NDJSON (offline)
 
 The `nt-recorder` CLI connects to a live NT4 server and writes value events to a timestamped `.ndjson` file. It runs on the dev laptop and reads NT from the sim or robot; no robot-side changes are needed.
@@ -108,22 +124,41 @@ Output files are named `nt-record-<YYYY-MM-DDTHHMMSSZ>.ndjson` (no colons, Windo
 
 ## Tools
 
-The server exposes 17 tools (13 live + 4 offline). Every live tool response includes a `connected` flag.
+The server exposes 18 tools (13 live + 5 offline). Every live tool response includes a `connected` flag.
 
 ### Live tools
 
 | Tool | Description |
 | --- | --- |
-| `nt_connect` | Start the NT4 client and wait for a live connection. Returns `{"connected": bool, "status": "connected" \| "not connected"}`. |
+| `nt_connect` | Start the NT4 client and wait for a live connection. Pass exactly one target: `team_number`, or `server_ip`/`server_port` with the default `server_ip`. Parameters: `server_ip="127.0.0.1"`, `server_port=5810`, `team_number=None`, `identity="nt-mcp"`, `timeout_seconds=5.0`. Success returns `{"connected": true, "status": "connected", "target": {...}}` where `target` reports the resolved target (e.g. `{"kind": "server", "server_ip": "127.0.0.1", "server_port": 5810}` or `{"kind": "team", "team_number": 8326, "server_port": 5810}`). Two refusals return `{"connected": false, "error": ...}`: an ambiguous target (both `team_number` and a non-default `server_ip`) is rejected before any state change, and re-targeting a running client is rejected — call `nt_disconnect` first. On timeout the response adds `connections` diagnostics, `elapsed_seconds`, and a routing `hint`. The `team_number` path resolves robot addresses via pyntcore's team-number lookup; the exact address list is not yet verified against real hardware, so the resolved `target` is reported rather than assumed. |
 | `nt_disconnect` | Stop the NT4 client and tear down persistent subscriptions. Returns `{"connected": false, "status": "disconnected"}`. |
-| `nt_connection_info` | Return connection state: `{"connected": bool, "connections": [...]}`. |
+| `nt_connection_info` | Return connection state: `{"connected": bool, "connections": [{"remote_id", "remote_ip", "last_update"}], "target": resolved_target \| null, "version": str}`. `target` is the resolved connect target (null before the first connect); `version` is the installed package version (`"unknown"` when metadata is absent). |
 | `nt_get` | Return the JSON-normalized value of one topic. Response: `{"connected": bool, "value": jsonable \| null}`. |
 | `nt_get_multiple` | Return every requested topic. Response: `{"connected": bool, "values": {topic: value}}`. |
 | `nt_get_info` | Return topic metadata. Response: `{"connected": bool, "info": {name, type_str, properties} \| null}`. |
 | `nt_set` | Publish a value. Response: `{"connected": bool, "ok": bool, "warning": str \| null}`. Add `strict_type_check=True` to refuse type mismatches. |
 | `nt_set_multiple` | Write every `{topic: value}` pair. Response: `{"connected": bool, "results": {...}, "warnings": {...}}`. |
 | `nt_list_topics` | List topic names, filtered by `prefix`, `regex`, and/or `wildcard`. Response: `{"connected": bool, "topics": [...]}`. |
-| `nt_subscribe` | Sample updates under prefixes for `duration` seconds. Response: `{"connected": bool, "samples": {topic: [...] \| summary}}`. Supports `sample_interval`, `change_only`, and `format="summary"`. |
+| `nt_subscribe` | Sample updates under prefixes for `duration` seconds. **Breaking change:** the `format` parameter was removed in favour of `output`, which defaults to `"file"` — the same window is captured to an NDJSON recording (nt-recorder format, written into `output_dir` or `NT_RECORDINGS_DIR`) and the response is a compact receipt with **no sample values**. Inline modes: `output="summary"` returns min/max/mean/last per topic; `output="samples"` returns raw `{topic: [{"time", "value"}, ...]}`. Both inline modes are bounded by `limit` (per-topic), `max_rows` (total, default 5000), and a final 60,000-character ceiling — every drop states `truncated: true`. Inline modes refuse a bare `"/"` prefix; `output="file"` accepts it. `sample_interval` decimates events to one per topic per interval; `change_only` skips numeric changes at or below the threshold. |
+
+Default `nt_subscribe` receipt (no sample values, a few hundred serialized characters, far under the 20,000-character budget):
+
+```json
+{
+  "connected": true,
+  "output": "file",
+  "recording_id": "nt-record-2026-09-18T120000Z.ndjson",
+  "path": "recordings\\nt-record-2026-09-18T120000Z.ndjson",
+  "duration_seconds": 10.0,
+  "rows": 214,
+  "topic_count": 6,
+  "topics": ["/SmartDashboard/gyro_angle", "/SmartDashboard/left_speed"],
+  "topics_truncated": false,
+  "truncated": false
+}
+```
+
+`topics` lists at most 50 names (`topics_truncated: true` when more exist); `rows` is the number of events written and `truncated` is true when the `max_rows` capture cap stopped recording early.
 | `nt_start_subscription` | Open a persistent subscription. Response: `{"connected": bool, "subscription_id": str, "started": bool}`. |
 | `nt_poll_subscription` | Read buffered samples from a persistent subscription. Response: `{"connected": bool, "samples": {topic: [...]}}`. |
 | `nt_stop_subscription` | Stop a persistent subscription. Response: `{"connected": bool, "stopped": bool}`. |
@@ -134,16 +169,27 @@ The server exposes 17 tools (13 live + 4 offline). Every live tool response incl
 | --- | --- |
 | `nt_list_recordings` | List recordings. Each entry includes `id`, `path`, `size_bytes`, `modified` (Unix float), and `modified_iso` (UTC ISO-8601). |
 | `nt_get_recording_info` | Return duration, total sample count, topic count, and file metadata for a recording. |
-| `nt_get_history` | Return event history for one topic. Supports `last_seconds`, `sample_interval`, and `format="summary"`. |
+| `nt_get_history` | Return event history for one topic. Supports `last_seconds`, `sample_interval`, and `format="summary"`. The response always states `rows` (entries returned), `total_rows` (all matching events, counted even past the clip), and `truncated` (`total_rows > rows`, or the 60,000-character ceiling dropped rows) so clipping is never silent. |
 | `nt_list_topics_offline` | List unique topic names in a recording, filtered by `prefix`, `regex`, and/or `wildcard`. |
-| `nt_subscribe_offline` | Return events for every topic under prefixes. Supports `last_seconds`, `sample_interval`, and `format="summary"`. |
+| `nt_subscribe_offline` | Return events for every topic under prefixes. Supports `last_seconds`, `sample_interval`, and `format="summary"`. `limit` (default 1000 per topic) and `max_rows` (default 5000 total) bound the payload; like `nt_get_history`, the response always states `rows` / `total_rows` / `truncated`. A bare `"/"` prefix is refused — narrow it (e.g. `/SmartDashboard/`) or use the `nt-recorder` CLI to dump a whole recording. |
 
 The offline tools read from the directory set by the `NT_RECORDINGS_DIR` environment variable (defaults to `./recordings`). Recordings are local-only — the recorder runs on the dev laptop and reads NT from the sim/robot; no robot-side changes are needed.
+
+The `nt-recorder` CLI also supports `--team N` to connect via team number; the MCP `nt_connect` tool exposes the same choice via `team_number`.
 
 ## Development
 
 - Python 3.14.0 venv in `.venv`; deps installed from `requirements.txt` (`fastmcp==3.4.7`, `pyntcore==2026.2.2`).
 - Tests: `uv run pytest tests/ -v`
+
+## Release notes
+
+### 0.2.0 — breaking changes
+
+- **`nt_subscribe` output rework:** the `format` parameter was removed and replaced by `output`, which defaults to `"file"`. Callers that passed `format=` must switch to `output=`. In `"file"` mode the response is a compact receipt (recording path, row count, topic list) with no sample values; inline modes (`"summary"`, `"samples"`) are bounded by `limit`, `max_rows`, and a 60,000-character ceiling.
+- **Offline tools return receipts:** `nt_get_history` now includes `rows` / `total_rows` / `truncated`; `nt_subscribe_offline` returns `{recording_id, topics, rows, total_rows, truncated}`. Clipping is never silent.
+- **`nt_connect` target guards:** an ambiguous target (both `team_number` and a non-default `server_ip`) is rejected before any state change, and re-targeting a running client is refused — call `nt_disconnect` first.
+- **`nt_connection_info` gained `target` and `version`:** `target` is the resolved connect target (`null` before the first connect); `version` is the installed package version.
 
 ## License
 This project is under MIT License.

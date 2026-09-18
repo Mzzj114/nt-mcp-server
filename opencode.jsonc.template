@@ -6,5 +6,10 @@
       "command": ["uv", "run", "nt-mcp-server"],
       "enabled": true
     }
+  },
+  "skills": {
+    // Scanned recursively for **/SKILL.md. Relative paths resolve against the
+    // directory containing this config file.
+    "paths": ["../nt-mcp-server/skills"]
   }
 }

@@ -15,12 +15,16 @@ Server runs on **stdio** — MCP clients (opencode) launch it via `opencode.json
 
 Package `nt_mcp_server/` (4 modules, strict layering — each lower layer knows nothing about the one above):
 
-- `__init__.py` — FastMCP `mcp` instance + all 17 tool definitions. **Imports no ntcore.** Tools delegate to the module-level `manager = NTManager()`. Sync tools (`nt_set`, `nt_disconnect`, etc.) are plain functions; read tools are `async`.
+- `__init__.py` — FastMCP `mcp` instance + all 18 tool definitions. **Imports no ntcore.** Tools delegate to the module-level `manager = NTManager()`. Sync tools (`nt_set`, `nt_disconnect`, etc.) are plain functions; read tools are `async`.
 - `nt_manager.py` — `NTManager`: pure NT4 client lifecycle + reads/writes/subscribe streams. No MCP/FastMCP imports. Lazy default instance via `ntcore.NetworkTableInstance.getDefault()`.
-- `nt_recorder.py` — two unrelated pieces: the `nt-recorder` CLI (argparse `main`), and the **synchronous offline NDJSON reader API** (`list_recordings`, `get_history`, `subscribe_offline`, …) used by the offline MCP tools.
+- `nt_recorder.py` — two unrelated pieces: the `nt-recorder` CLI (argparse `main`), and the **synchronous offline NDJSON reader API** (`list_recordings`, `get_history`, `subscribe_offline`, …; `get_history`/`subscribe_offline` take `return_meta=True` to add `rows`/`total_rows`/`truncated`) used by the offline MCP tools.
 - `nt_types.py` — value normalization (`to_jsonable`), homogeneous-list classification, summaries. Pure, no connection state.
 
-17 tools = 13 live + 4 offline (`nt_list_recordings`, `nt_get_recording_info`, `nt_get_history`/`nt_subscribe_offline`/`nt_list_topics_offline`). **Every live tool response carries a top-level `connected` flag; disconnected reads return `{"connected": false, "error": ...}` instead.**
+18 tools = 13 live + 5 offline (`nt_list_recordings`, `nt_get_recording_info`, `nt_get_history`, `nt_subscribe_offline`, `nt_list_topics_offline`). **Every live tool response carries a top-level `connected` flag; disconnected reads return `{"connected": false, "error": ...}` instead.**
+
+Bounded-output contract: `nt_subscribe` defaults to `output="file"` (the `format` parameter was removed) — the window is captured to an NDJSON recording and the response is a compact receipt (`recording_id`, `path`, `duration_seconds`, `rows`, `topic_count`, `topics`, `topics_truncated`, `truncated`) with no sample values; inline `output="summary"`/`"samples"` modes are bounded by `limit` (per-topic), `max_rows` (total, default 5000), and a 60,000-character ceiling. Offline `nt_get_history`/`nt_subscribe_offline` responses always state `rows`/`total_rows`/`truncated` so clipping is never silent.
+
+Connect target rules: `nt_connect` takes exactly one target — `team_number`, or `server_ip`/`server_port` with the default `server_ip`. An ambiguous target (both `team_number` and a non-default `server_ip`) is refused before any state change; re-targeting a running client is refused (`nt_disconnect` first). The resolved target is reported as `target` in `nt_connect`/`nt_connection_info` responses; the `team_number` path's pyntcore address list is not yet verified against real hardware.
 
 ## NT4 gotchas (cost real debugging time)
 
