@@ -15,14 +15,22 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-from .nt_manager import NTManager
+from .nt_manager import NTConnectError, NTManager
+from .nt_types import enforce_max_chars, summarize
 from . import nt_recorder
 
 mcp = FastMCP("NetworkTables")
 manager = NTManager()
 
-_CONNECT_TIMEOUT_SECONDS = 2.0
+_CONNECT_TIMEOUT_SECONDS = 5.0
 _CONNECT_POLL_INTERVAL_SECONDS = 0.05
+
+# Outer safety guard: no tool response may serialize past this ceiling,
+# no matter what the row budgets allowed. See nt_types.enforce_max_chars.
+_MAX_RESPONSE_CHARS = 60_000
+
+# The file-mode receipt lists at most this many topic names.
+_MAX_RECEIPT_TOPICS = 50
 
 # Persistent subscription state. Each subscription is a background asyncio
 # Task consuming ``manager.subscribe_stream`` and appending to a list buffer.
@@ -52,26 +60,74 @@ def _stop_all_subscriptions() -> None:
     _subscription_buffers.clear()
 
 
+def _clip_topic_rows(
+    topics: dict[str, list[Any]], max_rows: int
+) -> tuple[dict[str, list[Any]], int]:
+    """Clip per-topic row lists until their total fits ``max_rows``.
+
+    Returns the clipped container (topic keys preserved, even when their
+    list empties) and the number of rows kept.
+    """
+    kept = 0
+    clipped: dict[str, list[Any]] = {}
+    for topic, rows in topics.items():
+        if kept >= max_rows:
+            clipped[topic] = rows[:0]
+            continue
+        room = max_rows - kept
+        if len(rows) > room:
+            clipped[topic] = rows[:room]
+            kept += room
+        else:
+            clipped[topic] = rows
+            kept += len(rows)
+    return clipped, kept
+
+
 @mcp.tool()
 async def nt_connect(
     server_ip: str = "127.0.0.1",
     server_port: int = 5810,
     team_number: int | None = None,
     identity: str = "nt-mcp",
+    timeout_seconds: float = _CONNECT_TIMEOUT_SECONDS,
 ) -> dict:
-    """Start the NT4 client and wait for a live connection."""
-    manager.connect(
-        server_ip=server_ip,
-        server_port=server_port,
-        team_number=team_number,
-        identity=identity,
-    )
-    deadline = time.monotonic() + _CONNECT_TIMEOUT_SECONDS
+    """Start the NT4 client and wait for a live connection.
+
+    Pass exactly one target: ``team_number``, or ``server_ip`` /
+    ``server_port`` with the default ``server_ip``. Conflicting targets
+    and re-targeting a running client are refused with a structured
+    error (``connected: false`` plus ``error``); call ``nt_disconnect``
+    before connecting elsewhere. On timeout the response carries
+    ``connections`` diagnostics and a routing ``hint``.
+    """
+    try:
+        manager.connect(
+            server_ip=server_ip,
+            server_port=server_port,
+            team_number=team_number,
+            identity=identity,
+        )
+    except NTConnectError as exc:
+        return {"connected": False, "status": "not connected", "error": str(exc)}
+    target = manager.target
+    start = time.monotonic()
+    deadline = start + timeout_seconds
     while time.monotonic() < deadline:
         if manager.is_connected():
-            return {"connected": True, "status": "connected"}
+            return {"connected": True, "status": "connected", "target": target}
         await asyncio.sleep(_CONNECT_POLL_INTERVAL_SECONDS)
-    return {"connected": False, "status": "not connected"}
+    return {
+        "connected": False,
+        "status": "not connected",
+        "target": target,
+        "connections": manager.connection_info()["connections"],
+        "elapsed_seconds": time.monotonic() - start,
+        "hint": (
+            "check the target address/port, that the robot's NT4 server "
+            "(5810) is listening, and the host routing"
+        ),
+    }
 
 
 @mcp.tool()
@@ -180,25 +236,111 @@ async def nt_subscribe(
     duration: float = 10.0,
     sample_interval: float | None = None,
     change_only: float | None = None,
-    format: str = "samples",
+    output: str = "file",
+    limit: int | None = None,
+    max_rows: int = 5000,
+    output_dir: str | None = None,
 ) -> dict:
     """Sample value updates under ``prefixes`` for ``duration`` seconds.
 
-    Response: ``{"connected": bool, "samples": {topic: [...] | summary}}``.
-    ``sample_interval`` decimates events to one per topic per interval.
-    ``change_only`` skips numeric changes at or below the threshold.
-    ``format="summary"`` returns min/max/mean/last per topic.
+    ``output`` supersedes the removed ``format`` parameter and defaults
+    to ``"file"``: the same window is captured to an NDJSON recording
+    (nt-recorder format, written into ``output_dir`` or
+    ``NT_RECORDINGS_DIR``) and the response is a compact receipt —
+    ``recording_id``, ``path``, ``rows``, ``topic_count``, the first 50
+    ``topics`` and ``truncated`` — with NO sample values.
+    ``output="summary"`` returns min/max/mean/last per topic;
+    ``output="samples"`` returns raw ``{topic: [{"time", "value"}, ...]}``.
+    Both inline modes are bounded: ``limit`` caps each topic's samples,
+    ``max_rows`` caps the total, and a final character ceiling keeps the
+    whole response under 60,000 serialized characters — every drop
+    states ``truncated: True``. Inline modes refuse a bare ``"/"``
+    prefix: narrow it (e.g. ``/SmartDashboard/``) or use
+    ``output="file"``. ``sample_interval`` decimates events to one per
+    topic per interval; ``change_only`` skips numeric changes at or
+    below the threshold.
     """
     if not manager.is_connected():
         return {"connected": False, "error": "NT server disconnected"}
+    if output not in ("file", "summary", "samples"):
+        return {
+            "connected": True,
+            "output": output,
+            "error": (
+                f"unknown output mode {output!r}; valid modes: "
+                "'file' (default, writes an NDJSON recording), "
+                "'summary', 'samples'"
+            ),
+        }
+    if output != "file" and any(p == "/" for p in prefixes):
+        return {
+            "connected": True,
+            "output": output,
+            "error": (
+                "prefix '/' matches every topic; narrow it "
+                "(e.g. '/SmartDashboard/') or use output='file' to capture "
+                "the same window into an NDJSON recording"
+            ),
+        }
+    if output == "file":
+        dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
+        recorder = nt_recorder.Recorder(
+            manager,
+            output_dir=dir_,
+            prefixes=prefixes,
+            duration=duration,
+            sample_interval=sample_interval,
+            change_only=change_only,
+            max_capture_rows=max_rows,
+        )
+        path = await recorder.run()
+        topics = recorder.topics
+        return {
+            "connected": True,
+            "output": "file",
+            "recording_id": os.path.basename(path),
+            "path": path,
+            "duration_seconds": duration,
+            "rows": recorder.rows,
+            "topic_count": len(topics),
+            "topics": topics[:_MAX_RECEIPT_TOPICS],
+            "topics_truncated": len(topics) > _MAX_RECEIPT_TOPICS,
+            "truncated": recorder.truncated,
+        }
+    # Inline modes: collect raw samples, enforce the total row budget,
+    # then reduce summaries from what survived the clip.
     samples = await manager.subscribe(
         prefixes,
         duration=duration,
         sample_interval=sample_interval,
         change_only=change_only,
-        format=format,
+        format="samples",
+        limit=limit,
     )
-    return {"connected": True, "samples": samples}
+    rows = sum(len(topic_samples) for topic_samples in samples.values())
+    truncated = False
+    if rows > max_rows:
+        samples, rows = _clip_topic_rows(samples, max_rows)
+        truncated = True
+    if output == "summary":
+        samples = {
+            topic: summarize(topic_samples)
+            for topic, topic_samples in samples.items()
+        }
+    # Outermost guard: the row budgets above bound the row COUNT, but a
+    # single sample's value can be large enough to overflow the ceiling.
+    # Summary containers hold no row lists, so the guard passes them
+    # through untouched.
+    return enforce_max_chars(
+        {
+            "connected": True,
+            "samples": samples,
+            "rows": rows,
+            "truncated": truncated,
+        },
+        "samples",
+        _MAX_RESPONSE_CHARS,
+    )
 
 
 @mcp.tool()
@@ -291,19 +433,23 @@ def nt_get_history(
     start: float | None = None,
     end: float | None = None,
     last_seconds: float | None = None,
-    limit: int | None = None,
+    limit: int = 5000,
     sample_interval: float | None = None,
     format: str = "samples",
     output_dir: str | None = None,
-) -> list[dict]:
+) -> dict:
     """Return event history for one topic from a recording.
 
     ``last_seconds`` selects the most recent N seconds of the recording.
     ``sample_interval`` and ``format="summary"`` behave like live
-    ``nt_subscribe``.
+    ``nt_subscribe``. At most ``limit`` entries are returned; the response
+    always states ``rows``, ``total_rows`` (all matching events, counted
+    even past the clip) and ``truncated`` so clipping is never silent.
+    A final character ceiling keeps the whole response under 60,000
+    serialized characters; any rows it drops set ``truncated: True``.
     """
     dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
-    return nt_recorder.get_history(
+    result = nt_recorder.get_history(
         topic,
         recording_id,
         dir_,
@@ -313,7 +459,21 @@ def nt_get_history(
         limit,
         sample_interval,
         format,
+        return_meta=True,
     )
+    payload = {
+        "topic": topic,
+        "recording_id": recording_id,
+        "rows": result["rows"],
+        "total_rows": result["total_rows"],
+        "truncated": result["truncated"],
+    }
+    if format == "summary":
+        payload["summary"] = result["summary"]
+    else:
+        payload["samples"] = result["samples"]
+        payload = enforce_max_chars(payload, "samples", _MAX_RESPONSE_CHARS)
+    return payload
 
 
 @mcp.tool()
@@ -350,19 +510,38 @@ def nt_subscribe_offline(
     start: float | None = None,
     end: float | None = None,
     last_seconds: float | None = None,
-    limit: int | None = None,
+    limit: int = 1000,
+    max_rows: int = 5000,
     sample_interval: float | None = None,
     format: str = "samples",
     output_dir: str | None = None,
-) -> dict[str, list[dict]]:
+) -> dict:
     """Return events for every topic under ``prefixes`` from a recording.
 
     ``last_seconds`` selects the most recent N seconds. ``sample_interval``
     decimates per-topic samples, and ``format="summary"`` returns
-    min/max/mean/last per topic.
+    min/max/mean/last per topic. ``limit`` caps entries per topic and
+    ``max_rows`` caps the total across topics; the response always states
+    ``rows``, ``total_rows`` and ``truncated`` so clipping is never silent.
+    A bare ``"/"`` prefix is refused — narrow it (e.g. ``/SmartDashboard/``)
+    or use the ``nt-recorder`` CLI to dump a whole recording. A final
+    character ceiling keeps the whole response under 60,000 serialized
+    characters; any rows it drops set ``truncated: True``.
     """
+    if any(p == "/" for p in prefixes):
+        return {
+            "recording_id": recording_id,
+            "error": (
+                "prefix '/' matches every topic in the recording; narrow it "
+                "(e.g. '/SmartDashboard/') or use the nt-recorder CLI to "
+                "dump the whole recording to a file"
+            ),
+            "rows": 0,
+            "total_rows": 0,
+            "truncated": False,
+        }
     dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
-    return nt_recorder.subscribe_offline(
+    result = nt_recorder.subscribe_offline(
         prefixes,
         recording_id,
         dir_,
@@ -372,6 +551,32 @@ def nt_subscribe_offline(
         limit,
         sample_interval,
         format,
+        return_meta=True,
+    )
+    topics = result["topics"] if format != "summary" else result["summary"]
+    rows = result["rows"]
+    total_rows = result["total_rows"]
+    truncated = result["truncated"]
+    if format != "summary" and rows > max_rows:
+        # Enforce the total budget truthfully: clip per-topic lists until
+        # the sum fits, then recompute rows/truncated from what remains.
+        # Summary payloads are one small dict per topic - no row clip.
+        topics, rows = _clip_topic_rows(topics, max_rows)
+        truncated = True
+    # Outermost guard: the row budgets above bound the row COUNT, but a
+    # single row's value can be large enough that 5000 rows still serialize
+    # past the ceiling. enforce_max_chars drops rows until the whole
+    # envelope fits 60,000 characters and keeps rows/truncated truthful.
+    return enforce_max_chars(
+        {
+            "recording_id": recording_id,
+            "topics": topics,
+            "rows": rows,
+            "total_rows": total_rows,
+            "truncated": truncated,
+        },
+        "topics",
+        _MAX_RESPONSE_CHARS,
     )
 
 
