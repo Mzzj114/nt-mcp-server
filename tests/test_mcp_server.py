@@ -20,6 +20,7 @@ under ``pytest.mark.anyio``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
@@ -145,6 +146,13 @@ async def test_nt_connect_refuses_retarget_when_running(mcp_synced: None) -> Non
         "server_ip": "127.0.0.1",
         "server_port": PORT,
     }
+
+    # The refusal must not have disturbed the live connection: a REAL
+    # read of a fixture topic still returns its value (not just
+    # bookkeeping — the actual NT4 traffic survived).
+    read = await nt_mcp_server.nt_get("/SmartDashboard/test_num")
+    assert read["connected"] is True
+    assert read["value"] == 42.0
 
 
 @pytest.mark.anyio
@@ -427,6 +435,67 @@ async def test_nt_disconnect_returns_status_and_reconnects(mcp_synced: None) -> 
         "connected": True,
         "status": "connected",
         "target": {"kind": "server", "server_ip": "127.0.0.1", "server_port": PORT},
+    }
+
+
+@pytest.mark.anyio
+async def test_nt_disconnect_then_reconnect_to_different_target(
+    mcp_synced: None,
+) -> None:
+    """After nt_disconnect, connecting to a DIFFERENT target succeeds.
+
+    Regression guard for the old sticky no-op: ``connect()`` used to
+    return early while the client was running, so a disconnect was the
+    only way to re-target. Proves the new target is recorded and the
+    live connection actually serves reads, then restores the module
+    fixture's target for the tests that follow.
+    """
+    assert nt_mcp_server.nt_disconnect() == {
+        "connected": False,
+        "status": "disconnected",
+    }
+
+    second_server = ntcore.NetworkTableInstance.create()
+    second_server.startServer(
+        persist_filename="networktables.json",
+        listen_address="",
+        port3=1735,
+        port4=5812,
+    )
+    second_server.getEntry("/SmartDashboard/second_num").setDouble(7.0)
+    try:
+        status = await nt_mcp_server.nt_connect(
+            server_ip="127.0.0.1", server_port=5812, timeout_seconds=5.0
+        )
+        assert status == {
+            "connected": True,
+            "status": "connected",
+            "target": {
+                "kind": "server",
+                "server_ip": "127.0.0.1",
+                "server_port": 5812,
+            },
+        }
+
+        async def synced() -> bool:
+            response = await nt_mcp_server.nt_get("/SmartDashboard/second_num")
+            return response["connected"] is True and response["value"] is not None
+
+        assert await wait_until(
+            synced, timeout=10.0
+        ), "reconnected client never synced the second server's topic"
+    finally:
+        nt_mcp_server.nt_disconnect()
+        second_server.stopServer()
+        ntcore.NetworkTableInstance.destroy(second_server)
+
+    # Restore the module fixture's target for the remaining tests.
+    status = await nt_mcp_server.nt_connect(server_ip="127.0.0.1", server_port=PORT)
+    assert status["connected"] is True
+    assert status["target"] == {
+        "kind": "server",
+        "server_ip": "127.0.0.1",
+        "server_port": PORT,
     }
 
 
@@ -892,3 +961,235 @@ def test_nt_get_history_char_ceiling_worst_case(tmp_path) -> None:
     assert result["rows"] == len(result["samples"])
     assert result["rows"] < 5000  # char guard dropped rows the limit kept
     assert result["total_rows"] == 6000
+
+
+# --- Output-budget regression tests (plan checkbox 10) -----------------------
+#
+# These lock the budget invariant end to end through the MCP tools so the
+# unbounded-samples defect class cannot return. The authoritative worst case
+# (f) publishes its own churning topic so the assertion does not depend on
+# how many topics the module fixture happens to publish.
+
+
+RECEIPT_KEYS = {
+    "connected",
+    "output",
+    "recording_id",
+    "path",
+    "duration_seconds",
+    "rows",
+    "topic_count",
+    "topics",
+    "topics_truncated",
+    "truncated",
+}
+
+
+@pytest.mark.anyio
+async def test_budget_default_subscribe_receipt_is_bounded(
+    mcp_synced: None, tmp_path
+) -> None:
+    """(a) A broad default nt_subscribe returns a small value-free receipt.
+
+    Given the synced fixture, When nt_subscribe runs with default
+    arguments on the whole /SmartDashboard/ prefix, Then the response is
+    exactly the receipt contract (no "samples" key, so no sample values
+    can leak) and serializes far under the 20,000-char receipt budget.
+    """
+    response = await nt_mcp_server.nt_subscribe(
+        ["/SmartDashboard/"], duration=1.0, output_dir=str(tmp_path)
+    )
+    assert response["connected"] is True
+    assert set(response) == RECEIPT_KEYS
+    assert "samples" not in response
+    receipt = json.dumps(response)
+    assert len(receipt) < 20_000, f"receipt serialized to {len(receipt)} chars"
+
+
+@pytest.mark.anyio
+async def test_budget_samples_mode_max_rows_caps_total_rows(
+    mcp_synced: None,
+) -> None:
+    """(b) output='samples' with max_rows=10 returns at most 10 total rows.
+
+    Given a churning topic guaranteeing more than 10 events on the
+    prefix, When nt_subscribe collects samples with max_rows=10, Then
+    truncated is True and the summed per-topic rows are exactly the
+    reported rows, capped at 10.
+    """
+    topic = "/SmartDashboard/budget_churn_num"
+
+    async def churn() -> None:
+        for i in range(20):
+            nt_mcp_server.nt_set(topic, float(i))
+            await asyncio.sleep(0.05)
+
+    churn_task = asyncio.create_task(churn())
+    response = await nt_mcp_server.nt_subscribe(
+        ["/SmartDashboard/"],
+        duration=1.0,
+        output="samples",
+        max_rows=10,
+    )
+    await churn_task
+    assert response["connected"] is True
+    assert response["truncated"] is True
+    total_rows = sum(len(v) for v in response["samples"].values())
+    assert total_rows <= 10
+    assert response["rows"] == total_rows
+
+
+@pytest.mark.anyio
+async def test_budget_bare_root_summary_returns_structured_error(
+    mcp_synced: None,
+) -> None:
+    """(c) nt_subscribe(prefixes=['/'], output='summary') refuses inline.
+
+    Given the synced fixture, When a bare '/' prefix is requested with an
+    inline mode, Then the response is a structured error naming the
+    prefix and the sanctioned output='file' escape — never samples.
+    """
+    response = await nt_mcp_server.nt_subscribe(
+        ["/"], output="summary", duration=0.5
+    )
+    assert response["connected"] is True
+    assert "error" in response
+    assert "prefix '/'" in response["error"]
+    assert "output='file'" in response["error"]
+    assert "samples" not in response
+
+
+@pytest.mark.anyio
+async def test_budget_subscribe_offline_max_rows_truncates(
+    mcp_synced: None, tmp_path
+) -> None:
+    """(d) nt_subscribe_offline(max_rows=10) sets truncated on a dense read.
+
+    Given a recording with more matching events than the budget, When the
+    offline tool reads with max_rows=10, Then truncated is True, the
+    summed per-topic rows equal the reported rows, and the envelope stays
+    under the 60,000-char ceiling.
+    """
+    topic = "/SmartDashboard/budget_offline_num"
+
+    async def churn() -> None:
+        for i in range(20):
+            nt_mcp_server.nt_set(topic, float(i))
+            await asyncio.sleep(0.05)
+
+    churn_task = asyncio.create_task(churn())
+    recorder = nt_recorder.Recorder(
+        nt_mcp_server.manager,
+        output_dir=str(tmp_path),
+        prefixes=["/SmartDashboard/"],
+        duration=1.0,
+    )
+    await recorder.run()
+    await churn_task
+    assert recorder.rows > 10, "fixture must produce more than 10 events"
+
+    result = nt_mcp_server.nt_subscribe_offline(
+        ["/SmartDashboard/"], output_dir=str(tmp_path), max_rows=10
+    )
+    assert result["truncated"] is True
+    total_rows = sum(len(v) for v in result["topics"].values())
+    assert total_rows <= 10
+    assert result["rows"] == total_rows
+    assert result["total_rows"] == recorder.rows
+    assert len(json.dumps(result)) <= 60_000
+
+
+@pytest.mark.anyio
+async def test_budget_get_history_limit_reports_true_total(
+    mcp_synced: None, tmp_path
+) -> None:
+    """(e) nt_get_history(limit=2) reports truncated truthfully.
+
+    Given a fixture recording whose topic holds exactly ``recorded``
+    events, When nt_get_history reads with limit=2, Then rows == 2,
+    truncated is True iff the true count exceeds 2, and total_rows equals
+    the real number of events in the recording.
+    """
+    topic = "/SmartDashboard/budget_hist_num"
+    recorded = 5
+
+    async def churn() -> None:
+        for i in range(recorded):
+            nt_mcp_server.nt_set(topic, float(i))
+            await asyncio.sleep(0.05)
+
+    churn_task = asyncio.create_task(churn())
+    recorder = nt_recorder.Recorder(
+        nt_mcp_server.manager,
+        output_dir=str(tmp_path),
+        prefixes=["/SmartDashboard/"],
+        duration=1.0,
+    )
+    recording_path = await recorder.run()
+    await churn_task
+    assert recorder.rows >= recorded, "fixture must record at least 5 events"
+
+    # The true count for THIS topic, straight from the NDJSON file.
+    with open(recording_path, encoding="utf-8") as file:
+        topic_events = sum(
+            1 for line in file if json.loads(line)["topic"] == topic
+        )
+    assert topic_events >= recorded
+
+    result = nt_mcp_server.nt_get_history(
+        topic, output_dir=str(tmp_path), limit=2
+    )
+    assert result["rows"] == 2
+    assert result["total_rows"] == topic_events
+    assert result["truncated"] is (topic_events > 2)
+    assert len(result["samples"]) == 2
+
+
+@pytest.mark.anyio
+async def test_budget_worst_case_broad_prefix_stays_under_60k_chars(
+    mcp_synced: None,
+) -> None:
+    """(f) Authoritative worst case: a long broad-prefix window stays <60k.
+
+    Given a churning topic flooding the /SmartDashboard/ prefix with
+    dense rows for the whole window (the churn, not the fixture's static
+    topics, creates the load), When nt_subscribe samples with the default
+    max_rows=5000 row budget, Then the char guard holds the serialized
+    response under the 60,000-character ceiling with truncated=True.
+    """
+    topic = "/SmartDashboard/budget_flood_num"
+
+    async def flood() -> None:
+        i = 0
+        while True:
+            # 200-element double arrays: each row serializes to ~1.3 KB, so
+            # ~45 rows fill the 60,000-char ceiling. A 0.01s flood reliably
+            # produces far more rows than that inside the 5s window.
+            nt_mcp_server.nt_set(topic, [float(i + j) for j in range(200)])
+            i += 1
+            await asyncio.sleep(0.01)
+
+    churn_task = asyncio.create_task(flood())
+    try:
+        response = await nt_mcp_server.nt_subscribe(
+            ["/SmartDashboard/"],
+            duration=5.0,
+            output="samples",
+        )
+    finally:
+        churn_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await churn_task
+
+    dumped = json.dumps(response)
+    assert response["connected"] is True
+    assert response["truncated"] is True
+    assert response["rows"] == sum(len(v) for v in response["samples"].values())
+    # The flood must genuinely threaten the ceiling: each row is a
+    # ~1.3 KB array sample, so the row budget alone (5000 rows) would
+    # serialize to megabytes. This assertion only passes because the
+    # char guard fired and dropped rows.
+    assert response["rows"] > 10
+    assert len(dumped) <= 60_000, (
+        f"worst-case response serialized to {len(dumped)} chars"
+    )
