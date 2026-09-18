@@ -81,7 +81,7 @@ A live recorder left running keeps growing the output file and mixes data from d
 
 ## The newer path: live capture via `nt_subscribe`
 
-The `nt_subscribe` MCP tool (with its planned `output="file"` mode) produces the same NDJSON format as `nt-recorder`. Instead of running a separate CLI process, the agent calls the tool, which writes a recording file and returns a compact receipt:
+The `nt_subscribe` MCP tool's default `output="file"` mode produces the same NDJSON format as `nt-recorder`. Instead of running a separate CLI process, the agent calls the tool, which captures the window into a recording file and returns a compact receipt:
 
 ```json
 {
