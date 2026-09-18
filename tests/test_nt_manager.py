@@ -19,6 +19,7 @@ methods are coroutines.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any
@@ -26,7 +27,15 @@ from typing import Any
 import ntcore
 import pytest
 
-from nt_mcp_server.nt_manager import NTManager
+from nt_mcp_server.nt_manager import (
+    DEFAULT_SERVER_IP,
+    DEFAULT_SERVER_PORT,
+    NTManager,
+    AmbiguousTargetError,
+    StreamDecimator,
+    TargetMismatchError,
+    _package_version,
+)
 
 PORT = 5810
 
@@ -87,6 +96,61 @@ async def manager(nt_server: ntcore.NetworkTableInstance) -> AsyncIterator[NTMan
     assert await wait_until(synced, timeout=15.0), "client never synced fixture topics"
     yield mgr
     mgr.disconnect()
+
+
+@pytest.fixture()
+def fresh_manager(nt_server: ntcore.NetworkTableInstance) -> Iterator[NTManager]:
+    """Unconnected NTManager for target-handling tests; torn down after."""
+    mgr = NTManager()
+    yield mgr
+    mgr.disconnect()
+
+
+# --- connect target handling (plan checkboxes 1 and 2) ---
+# NOTE: the ``fresh_manager`` tests below MUST run before any test that uses
+# the module-scoped ``manager`` fixture: every NTManager shares the default
+# NetworkTableInstance, so a second manager's ``disconnect()`` stops the
+# shared client and would kill the module fixture's loopback connection.
+
+
+@pytest.mark.anyio
+async def test_connect_ambiguous_target_raises_without_state_change(
+    fresh_manager: NTManager,
+) -> None:
+    """Given both team_number and a non-default server_ip, connect raises
+    AmbiguousTargetError before touching any instance state."""
+    with pytest.raises(AmbiguousTargetError, match="8326"):
+        fresh_manager.connect(server_ip="10.83.26.2", team_number=8326)
+    assert fresh_manager._client_running is False
+    assert fresh_manager.target is None
+
+
+@pytest.mark.anyio
+async def test_connect_server_records_target(fresh_manager: NTManager) -> None:
+    """Given a server target, mgr.target matches the requested target."""
+    fresh_manager.connect("127.0.0.1", PORT, identity="test")
+    assert fresh_manager.target == {
+        "kind": "server",
+        "server_ip": "127.0.0.1",
+        "server_port": PORT,
+    }
+
+
+@pytest.mark.anyio
+async def test_connect_same_target_is_idempotent(fresh_manager: NTManager) -> None:
+    """A second connect() with identical args does not raise."""
+    fresh_manager.connect("127.0.0.1", PORT, identity="test")
+    fresh_manager.connect("127.0.0.1", PORT, identity="test")
+    assert fresh_manager._client_running is True
+
+
+@pytest.mark.anyio
+async def test_disconnect_resets_target(fresh_manager: NTManager) -> None:
+    """After disconnect(), target is None."""
+    fresh_manager.connect("127.0.0.1", PORT, identity="test")
+    fresh_manager.disconnect()
+    assert fresh_manager.target is None
+    assert fresh_manager._client_running is False
 
 
 @pytest.mark.anyio
@@ -316,3 +380,126 @@ async def test_subscribe_stream_all_topics(manager: NTManager) -> None:
     except TimeoutError:
         pass
     assert set(topics_seen) >= set(FIXTURE_NAMES)
+
+
+def test_stream_decimator_change_only_drops_small_numeric_changes() -> None:
+    """Given change_only=0.5, near-identical numerics drop; bools and
+    non-numerics never drop via the numeric-diff path (bools are excluded
+    from it and the equality fallback only applies to non-numeric pairs)."""
+    dec = StreamDecimator(change_only=0.5)
+    assert dec.keep("/t", 1.0, 0.0) is True
+    assert dec.keep("/t", 1.2, 0.1) is False  # |1.2 - 1.0| <= 0.5
+    assert dec.keep("/t", 2.0, 0.2) is True
+    assert dec.keep("/t", True, 0.3) is True  # bool vs numeric: kept
+    assert dec.keep("/t", True, 0.4) is True  # equal bool: kept (bool path)
+    assert dec.keep("/t", "hi", 0.5) is True
+    assert dec.keep("/t", "hi", 0.6) is False  # equal non-numeric dropped
+
+
+def test_stream_decimator_change_only_zero_keeps_distinct_values() -> None:
+    """Given change_only=0 and a strictly-changing sequence, nothing drops."""
+    dec = StreamDecimator(change_only=0.0)
+    assert dec.keep("/t", 1.0, 0.0) is True
+    assert dec.keep("/t", 2.0, 0.1) is True
+    assert dec.keep("/t", 3.0, 0.2) is True
+
+
+def test_stream_decimator_sample_interval_one_per_topic_per_interval() -> None:
+    """Given sample_interval=0.1, at most one sample per topic per 0.1s,
+    tracked independently per topic."""
+    dec = StreamDecimator(sample_interval=0.1)
+    assert dec.keep("/t", 1.0, 0.0) is True
+    assert dec.keep("/t", 2.0, 0.05) is False
+    assert dec.keep("/t", 3.0, 0.2) is True
+    assert dec.keep("/other", 9.0, 0.01) is True
+
+
+@pytest.mark.anyio
+async def test_subscribe_limit_caps_samples_per_topic(manager: NTManager) -> None:
+    """subscribe(..., limit=1) returns at most one sample per topic."""
+    samples = await manager.subscribe(["/SmartDashboard/"], duration=1.0, limit=1)
+    for name in FIXTURE_NAMES:
+        assert name in samples, f"no samples for {name}"
+    for events in samples.values():
+        assert len(events) <= 1
+
+
+@pytest.mark.anyio
+async def test_connect_different_port_raises_target_mismatch(
+    manager: NTManager,
+) -> None:
+    """Given a running client, connect() with a different server_port raises
+    TargetMismatchError naming both targets."""
+    with pytest.raises(TargetMismatchError, match="5811"):
+        manager.connect(server_ip="127.0.0.1", server_port=5811)
+    assert manager._client_running is True
+    assert manager.target == {
+        "kind": "server",
+        "server_ip": "127.0.0.1",
+        "server_port": PORT,
+    }
+
+
+@pytest.mark.anyio
+async def test_connection_info_carries_target_and_version(
+    manager: NTManager,
+) -> None:
+    """connection_info() reports the resolved target and a version string."""
+    info = manager.connection_info()
+    assert info["target"] == {
+        "kind": "server",
+        "server_ip": "127.0.0.1",
+        "server_port": PORT,
+    }
+    assert isinstance(info["version"], str)
+    assert info["version"]
+    assert info["connected"] is True
+    assert "connections" in info
+
+
+@pytest.mark.anyio
+async def test_package_version_falls_back_when_metadata_absent(
+    manager: NTManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Given package metadata is absent, _package_version() returns
+    "unknown" instead of raising, and connection_info()["version"] stays a
+    JSON-serializable non-empty string."""
+    from importlib.metadata import PackageNotFoundError
+
+    assert isinstance(_package_version(), str)
+    assert _package_version()
+
+    def raise_package_not_found(name: str) -> str:
+        raise PackageNotFoundError(name)
+
+    # Patch the module-level name nt_manager actually calls (it did
+    # ``from importlib.metadata import ... version`` at import time).
+    monkeypatch.setattr(
+        "nt_mcp_server.nt_manager.version", raise_package_not_found
+    )
+    assert _package_version() == "unknown"
+    info = manager.connection_info()
+    assert isinstance(info["version"], str)
+    assert info["version"]
+    json.dumps(info)
+
+
+# NOTE: this test must run LAST in this module. ``setServerTeam`` replaces
+# the whole server list on the shared default NetworkTableInstance, which
+# would break the module-scoped ``manager`` fixture's loopback connection
+# for any test running after it.
+@pytest.mark.anyio
+async def test_connect_team_records_target_with_requested_port(
+    fresh_manager: NTManager,
+) -> None:
+    """Given team_number with the default server_ip and a NON-default port,
+    connect does not raise and records a team target carrying the requested
+    port (proves the port is no longer dropped by setServerTeam)."""
+    fresh_manager.connect(
+        server_ip=DEFAULT_SERVER_IP, server_port=5910, team_number=8326
+    )
+    assert fresh_manager.target == {
+        "kind": "team",
+        "team_number": 8326,
+        "server_port": 5910,
+    }

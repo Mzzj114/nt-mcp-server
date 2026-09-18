@@ -12,6 +12,7 @@ import fnmatch
 import re
 import time
 from collections.abc import AsyncIterator
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
 import ntcore
@@ -30,6 +31,75 @@ except ImportError:  # pragma: no cover - Python 3.10
 _READ_TIMEOUT_SECONDS = 1.0
 _ANNOUNCE_WAIT_SECONDS = 0.5
 
+DEFAULT_SERVER_IP = "127.0.0.1"
+DEFAULT_SERVER_PORT = 5810
+
+
+class NTConnectError(RuntimeError):
+    """Base error for connect target conflicts."""
+
+
+class AmbiguousTargetError(NTConnectError):
+    """Both a team number and a non-default server IP were requested."""
+
+
+class TargetMismatchError(NTConnectError):
+    """A running client was asked to connect to a different target."""
+
+
+def _package_version() -> str:
+    """Return the installed package version, or ``"unknown"``."""
+    try:
+        return version("nt-mcp-server")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+class StreamDecimator:
+    """Stateful per-topic sample filter shared by live and file capture.
+
+    ``keep(topic, value, time_seconds)`` returns ``False`` when the sample
+    must be dropped: ``sample_interval`` keeps at most one sample per topic
+    per interval (using the event timestamp); ``change_only`` skips samples
+    whose numeric value changed by ``<= change_only`` (bools always compare
+    by equality, as do non-numeric values). A dropped sample never updates
+    the per-topic state, matching the original inline ``subscribe()``
+    logic byte-for-byte for a fixed sample sequence.
+    """
+
+    def __init__(
+        self,
+        sample_interval: float | None = None,
+        change_only: float | None = None,
+    ) -> None:
+        self._sample_interval = sample_interval
+        self._change_only = change_only
+        self._last_time: dict[str, float] = {}
+        self._last_value: dict[str, Any] = {}
+        self._sentinel = object()
+
+    def keep(self, topic: str, value: Any, time_seconds: float) -> bool:
+        """Return whether the sample passes both filters."""
+        if self._sample_interval is not None:
+            interval = self._sample_interval
+            if time_seconds - self._last_time.get(topic, -interval) < interval:
+                return False
+            self._last_time[topic] = time_seconds
+        if self._change_only is not None:
+            prev = self._last_value.get(topic, self._sentinel)
+            if prev is not self._sentinel:
+                if isinstance(value, (int, float)) and isinstance(prev, (int, float)):
+                    if (
+                        not isinstance(value, bool)
+                        and not isinstance(prev, bool)
+                        and abs(value - prev) <= self._change_only
+                    ):
+                        return False
+                elif value == prev:
+                    return False
+            self._last_value[topic] = value
+        return True
+
 
 class NTManager:
     """Owns the ntcore client lifecycle for the MCP server.
@@ -45,6 +115,7 @@ class NTManager:
     def __init__(self) -> None:
         self._inst: ntcore.NetworkTableInstance | None = None
         self._client_running: bool = False
+        self._target: dict[str, Any] | None = None
         self._value_subs: dict[str, ntcore.GenericSubscriber] = {}
         self._topics_subscription: tuple[
             ntcore.MultiSubscriber, ntcore.NetworkTableListenerPoller
@@ -57,34 +128,83 @@ class NTManager:
             self._inst = ntcore.NetworkTableInstance.getDefault()
         return self._inst
 
+    @property
+    def target(self) -> dict[str, Any] | None:
+        """Return the resolved connect target, or ``None`` before connect.
+
+        JSON-safe: ``{"kind": "server", "server_ip": str, "server_port":
+        int}`` or ``{"kind": "team", "team_number": int, "server_port":
+        int}``.
+        """
+        return self._target
+
+    def _target_key(self, target: dict[str, Any]) -> tuple[Any, ...]:
+        """Return a hashable canonical key for a resolved target dict."""
+        return tuple(sorted(target.items()))
+
     def connect(
         self,
-        server_ip: str = "127.0.0.1",
-        server_port: int = 5810,
+        server_ip: str = DEFAULT_SERVER_IP,
+        server_port: int = DEFAULT_SERVER_PORT,
         team_number: int | None = None,
         identity: str = "nt-mcp",
     ) -> None:
         """Start the NT4 client against a server or team number.
 
-        Uses ``setServerTeam`` when ``team_number`` is given, otherwise
-        ``setServer(server_ip, server_port)``. Idempotent: calling again
-        while the client is running is a no-op.
+        Pass exactly one target: ``team_number`` (which resolves the
+        server address from the team number) or a non-default
+        ``server_ip``/``server_port`` pair. The resolved target is
+        recorded on :attr:`target` and reported by ``connection_info``.
+
+        Raises :class:`AmbiguousTargetError` when both a ``team_number``
+        and a non-default ``server_ip`` are given, before any state
+        changes. Raises :class:`TargetMismatchError` when the client is
+        already running against a different target — call ``disconnect``
+        first. Connecting to the same target while running is an
+        idempotent no-op.
         """
+        if team_number is not None and server_ip != DEFAULT_SERVER_IP:
+            raise AmbiguousTargetError(
+                f"both team_number={team_number!r} and server_ip={server_ip!r} "
+                "were given; pass exactly one target (team_number, or "
+                "server_ip/server_port with the default server_ip)"
+            )
+        if team_number is not None:
+            target: dict[str, Any] = {
+                "kind": "team",
+                "team_number": team_number,
+                "server_port": server_port,
+            }
+        else:
+            target = {
+                "kind": "server",
+                "server_ip": server_ip,
+                "server_port": server_port,
+            }
+        requested_key = self._target_key(target)
         if self._client_running:
+            if self._target is None or self._target_key(self._target) != requested_key:
+                raise TargetMismatchError(
+                    f"client is already running against target "
+                    f"{self._target!r}; refusing to re-target to {target!r} — "
+                    "call nt_disconnect first"
+                )
             return
         inst = self._instance()
-        if team_number is not None:
-            inst.setServerTeam(team_number)
+        if target["kind"] == "team":
+            inst.setServerTeam(target["team_number"], target["server_port"])
         else:
-            inst.setServer(server_ip, server_port)
+            inst.setServer(target["server_ip"], target["server_port"])
         inst.startClient4(identity)
         self._client_running = True
+        self._target = target
 
     def disconnect(self) -> None:
         """Stop the NT4 client. Idempotent; safe before any connect."""
         if self._client_running and self._inst is not None:
             self._inst.stopClient()
         self._client_running = False
+        self._target = None
         if self._topics_subscription is not None:
             subscriber, poller = self._topics_subscription
             subscriber.close()
@@ -119,7 +239,8 @@ class NTManager:
         """Return JSON-serializable connection state.
 
         ``{"connected": bool, "connections": [{"remote_id", "remote_ip",
-        "last_update"}]}``.
+        "last_update"}], "target": resolved_target | None, "version":
+        str}``.
         """
         inst = self._instance()
         info: dict[str, Any] = {
@@ -132,6 +253,8 @@ class NTManager:
                 }
                 for conn in inst.getConnections()
             ],
+            "target": self._target,
+            "version": _package_version(),
         }
         return to_jsonable(info)
 
@@ -350,6 +473,7 @@ class NTManager:
         sample_interval: float | None = None,
         change_only: float | None = None,
         format: str = "samples",
+        limit: int | None = None,
     ) -> dict[str, Any]:
         """Sample value updates under ``prefixes`` for ``duration`` s.
 
@@ -360,7 +484,8 @@ class NTManager:
         changed by ``<= change_only``; non-numeric values are skipped only
         when unchanged. ``format="summary"`` replaces each topic's sample
         list with ``{"count", "last_value", "last_time", "min", "max",
-        "mean"}``.
+        "mean"}``. ``limit`` caps each topic's collected sample list to its
+        first ``limit`` samples.
 
         ``asyncio.timeout`` enforces the deadline when no events flow; the
         monotonic check provides an early exit when events flow past the
@@ -368,31 +493,14 @@ class NTManager:
         """
         results: dict[str, list[dict]] = {}
         end = time.monotonic() + duration
-        last_time: dict[str, float] = {}
-        last_value: dict[str, Any] = {}
-        sentinel = object()
+        decimator = StreamDecimator(
+            sample_interval=sample_interval, change_only=change_only
+        )
         try:
             async with asyncio.timeout(duration):
                 async for topic, value, time_seconds in self.subscribe_stream(prefixes):
-                    if sample_interval is not None:
-                        if time_seconds - last_time.get(topic, -sample_interval) < sample_interval:
-                            continue
-                        last_time[topic] = time_seconds
-                    if change_only is not None:
-                        prev = last_value.get(topic, sentinel)
-                        if prev is not sentinel:
-                            if isinstance(value, (int, float)) and isinstance(
-                                prev, (int, float)
-                            ):
-                                if (
-                                    not isinstance(value, bool)
-                                    and not isinstance(prev, bool)
-                                    and abs(value - prev) <= change_only
-                                ):
-                                    continue
-                            elif value == prev:
-                                continue
-                        last_value[topic] = value
+                    if not decimator.keep(topic, value, time_seconds):
+                        continue
                     results.setdefault(topic, []).append(
                         {"time": time_seconds, "value": value}
                     )
@@ -400,6 +508,8 @@ class NTManager:
                         break
         except TimeoutError:
             pass
+        if limit is not None:
+            results = {topic: samples[:limit] for topic, samples in results.items()}
         if format == "summary":
             return {topic: summarize(samples) for topic, samples in results.items()}
         return results
