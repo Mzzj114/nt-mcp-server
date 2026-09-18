@@ -7,6 +7,7 @@ by the NT layer; no ntcore connection state lives here.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Literal
 
 try:  # numpy is optional — normalize numpy values only when it is present
@@ -142,3 +143,107 @@ def type_warning(value: Any, type_str: str) -> str | None:
         if not isinstance(value, str):
             return f"expected string, got {type(value).__name__}"
     return None
+
+
+def enforce_max_chars(
+    response: dict[str, Any],
+    container_key: str,
+    max_chars: int,
+) -> dict[str, Any]:
+    """Trim a tool response's row container until it serializes <= ``max_chars``.
+
+    ``response`` is a JSON-able envelope whose ``container_key`` field holds
+    either a flat list of rows (``nt_get_history`` samples) or a dict of
+    topic -> list of rows (``nt_subscribe_offline`` topics; ``nt_subscribe``
+    sample modes). Rows that do not fit the ceiling are dropped; non-list
+    values (summaries) are never touched, and a container with none is
+    returned unchanged.
+
+    Deterministic and linear: topic groups are visited in sorted name order
+    and rows in list order, each row is serialized exactly once to learn its
+    size (a row's ``value`` may be a large nested list/dict, so the cost is
+    never assumed constant), and a row is kept iff its serialized size plus
+    a 2-char separator allowance fits the remaining budget. A skipped row
+    does not stop the scan — a smaller later row can still fit. The 2-char
+    allowance over-charges the first row of each list, so the result is
+    guaranteed to serialize <= ``max_chars``. If the topic keys alone
+    overflow the ceiling, whole topics are dropped from the end of the
+    sorted order (alphabetically-last first) until the empty envelope fits.
+
+    Returns a new envelope; the input is not mutated. ``rows`` (when present)
+    is recomputed to the rows that actually remain, and ``truncated`` is
+    forced True whenever any row or topic was dropped. ``total_rows`` and
+    every other field pass through untouched.
+    """
+    container = response.get(container_key)
+    if isinstance(container, list):
+        groups: list[tuple[str, list[Any]]] = [("", container)]
+        flat = True
+    elif isinstance(container, dict):
+        groups = sorted(
+            (topic, rows)
+            for topic, rows in container.items()
+            if isinstance(rows, list)
+        )
+        if not groups:
+            return response
+        flat = False
+    else:
+        return response
+
+    # Fixed envelope overhead, measured once with every row list emptied
+    # (topic keys kept): each kept row then costs its own JSON size.
+    emptied = dict(response)
+    if flat:
+        emptied[container_key] = []
+    else:
+        emptied[container_key] = {
+            topic: ([] if isinstance(rows, list) else rows)
+            for topic, rows in container.items()
+        }
+    remaining = max_chars - len(json.dumps(emptied))
+
+    kept_rows: dict[str, list[Any]] = {}
+    kept_count = 0
+    total_count = 0
+    for topic, rows in groups:
+        survivors: list[Any] = []
+        for row in rows:
+            total_count += 1
+            cost = len(json.dumps(row)) + 2
+            if cost <= remaining:
+                remaining -= cost
+                survivors.append(row)
+        kept_rows[topic] = survivors
+        kept_count += len(survivors)
+
+    dropped_topics = 0
+    if remaining < 0 and not flat:
+        # Topic keys alone overflow the ceiling: drop whole topics from the
+        # end of the sorted order. Dropping shrinks the overhead, so the
+        # freed cost INCREASES the remaining budget. The charged cost
+        # (entry + separator) is >= the actual saving, keeping the
+        # guarantee intact.
+        for topic, _ in reversed(groups):
+            if remaining >= 0:
+                break
+            remaining += len(json.dumps({topic: []})) + 2
+            del kept_rows[topic]
+            dropped_topics += 1
+
+    result = dict(response)
+    if flat:
+        result[container_key] = kept_rows[""]
+    else:
+        new_container = {
+            topic: rows
+            for topic, rows in container.items()
+            if not isinstance(rows, list)
+        }
+        new_container.update(kept_rows)
+        result[container_key] = new_container
+    if kept_count < total_count or dropped_topics:
+        result["truncated"] = True
+    if "rows" in response:
+        result["rows"] = kept_count
+    return result

@@ -29,7 +29,7 @@ import sys
 import time
 from typing import Any, Iterator
 
-from .nt_manager import NTManager
+from .nt_manager import NTConnectError, NTManager, StreamDecimator
 from .nt_types import summarize
 
 _CONNECT_TIMEOUT_SECONDS = 5.0
@@ -42,6 +42,14 @@ class Recorder:
     One JSON object per event: ``{"time": float, "topic": str, "value": jsonable}``.
     The file is flushed after every line and closed when ``run`` returns.
     When ``duration`` is None, runs until ``stop_event`` is set.
+
+    Optional capture filters (all default None = unfiltered, uncapped):
+    ``sample_interval`` keeps at most one sample per topic per interval,
+    ``change_only`` drops samples whose value changed by <= the threshold,
+    both via the same ``StreamDecimator`` used by ``NTManager.subscribe``.
+    ``max_capture_rows`` stops capture once that many rows are written.
+    After ``run()``: ``rows`` (int), ``topics`` (sorted unique names written),
+    ``truncated`` (True only when the cap stopped capture early).
     """
 
     def __init__(
@@ -50,12 +58,23 @@ class Recorder:
         output_dir: str,
         prefixes: list[str],
         duration: float | None = None,
+        sample_interval: float | None = None,
+        change_only: float | None = None,
+        max_capture_rows: int | None = None,
     ) -> None:
         self.manager = manager
         self.output_dir = output_dir
         self.prefixes = prefixes
         self.duration = duration
         self.stop_event = asyncio.Event()
+        self._decimator = StreamDecimator(
+            sample_interval=sample_interval, change_only=change_only
+        )
+        self._max_capture_rows = max_capture_rows
+        self.rows = 0
+        self._topics: set[str] = set()
+        self.topics: list[str] = []
+        self.truncated = False
 
     async def run(self) -> str:
         """Subscribe, write events to NDJSON, return the output file path."""
@@ -74,11 +93,15 @@ class Recorder:
                         async for topic, value, time_seconds in (
                             self.manager.subscribe_stream(self.prefixes)
                         ):
-                            _write_event(file, topic, value, time_seconds)
+                            if not self._write_filtered(
+                                file, topic, value, time_seconds
+                            ):
+                                break
                 except TimeoutError:
                     pass
             else:
                 await self._run_until_stop(file)
+        self.topics = sorted(self._topics)
         return path
 
     async def _run_until_stop(self, file) -> None:
@@ -104,7 +127,24 @@ class Recorder:
         async for topic, value, time_seconds in (
             self.manager.subscribe_stream(self.prefixes)
         ):
-            _write_event(file, topic, value, time_seconds)
+            if not self._write_filtered(file, topic, value, time_seconds):
+                break
+
+    def _write_filtered(self, file, topic: str, value: Any, time_seconds: float) -> bool:
+        """Write one event through the decimator; update capture stats.
+
+        Returns False only when ``max_capture_rows`` was reached and the
+        caller must stop consuming (the file is already flushed per line).
+        """
+        if not self._decimator.keep(topic, value, time_seconds):
+            return True
+        _write_event(file, topic, value, time_seconds)
+        self.rows += 1
+        self._topics.add(topic)
+        if self._max_capture_rows is not None and self.rows >= self._max_capture_rows:
+            self.truncated = True
+            return False
+        return True
 
 
 def _write_event(file, topic: str, value: Any, time_seconds: float) -> None:
@@ -326,6 +366,23 @@ def _apply_time_filter(
     return start, end
 
 
+def _meta_result(
+    payload: Any, key: str, rows: int, total_rows: int
+) -> dict[str, Any]:
+    """Wrap a reader payload with visible-truncation metadata.
+
+    ``payload`` is the per-topic dict (``subscribe_offline``) or the
+    samples list (``get_history``); ``key`` names the field it is nested
+    under (``"samples"``, ``"summary"`` or ``"topics"``).
+    """
+    return {
+        key: payload,
+        "rows": rows,
+        "total_rows": total_rows,
+        "truncated": total_rows > rows,
+    }
+
+
 def get_history(
     topic: str,
     recording_id: str | None = None,
@@ -336,6 +393,7 @@ def get_history(
     limit: int | None = None,
     sample_interval: float | None = None,
     format: str = "samples",
+    return_meta: bool = False,
 ) -> list[dict] | dict:
     """Return the event history for one topic.
 
@@ -347,12 +405,19 @@ def get_history(
 
     Missing file returns ``[]``. Malformed lines are skipped with a warning
     to stderr.
+
+    With ``return_meta=True`` the return value is
+    ``{"samples": [...] | "summary": {...}, "rows": int, "total_rows": int,
+    "truncated": bool}`` instead: ``rows`` is the number of entries actually
+    returned, ``total_rows`` counts ALL matching events (counted even past
+    the ``limit`` clip), and ``truncated`` is ``total_rows > rows``.
     """
     path = _resolve_recording(recording_id, output_dir)
     if path is None:
-        return []
+        return [] if not return_meta else _meta_result([], "samples", 0, 0)
     start, end = _apply_time_filter(path, start, end, last_seconds)
     events: list[dict] = []
+    total_rows = 0
     for t, event in _iter_timed_events(path):
         if event.get("topic") != topic:
             continue
@@ -360,13 +425,18 @@ def get_history(
             continue
         if end is not None and t >= end:
             continue
-        events.append({"time": t, "value": event.get("value")})
+        total_rows += 1
         if limit is not None and len(events) >= limit:
-            break
+            continue
+        events.append({"time": t, "value": event.get("value")})
     if sample_interval is not None:
         events = _downsample(events, sample_interval)
+    rows = len(events)
     if format == "summary":
-        return summarize(events)
+        events = summarize(events)
+    if return_meta:
+        key = "summary" if format == "summary" else "samples"
+        return _meta_result(events, key, rows, total_rows)
     return events
 
 
@@ -415,6 +485,7 @@ def subscribe_offline(
     limit: int | None = None,
     sample_interval: float | None = None,
     format: str = "samples",
+    return_meta: bool = False,
 ) -> dict[str, Any]:
     """Return events for every topic under ``prefixes``.
 
@@ -425,13 +496,20 @@ def subscribe_offline(
     ``format="summary"`` behave like live ``nt_subscribe``. Missing file
     returns ``{}``. Malformed lines are skipped with a warning to stderr.
 
+    With ``return_meta=True`` the return value is
+    ``{"topics": {topic: [...] | summary}, "rows": int, "total_rows": int,
+    "truncated": bool}`` instead: ``rows`` is the number of entries actually
+    returned, ``total_rows`` counts ALL matching events (counted even past
+    the ``limit`` clip), and ``truncated`` is ``total_rows > rows``.
+
     Note: do not call on a recording currently being written.
     """
     path = _resolve_recording(recording_id, output_dir)
     if path is None:
-        return {}
+        return {} if not return_meta else _meta_result({}, "topics", 0, 0)
     start, end = _apply_time_filter(path, start, end, last_seconds)
     out: dict[str, list[dict]] = {}
+    total_rows = 0
     for t, event in _iter_timed_events(path):
         topic = event.get("topic")
         if not isinstance(topic, str):
@@ -442,13 +520,18 @@ def subscribe_offline(
             continue
         if end is not None and t >= end:
             continue
+        total_rows += 1
         if limit is not None and len(out.get(topic, ())) >= limit:
             continue
         out.setdefault(topic, []).append({"time": t, "value": event.get("value")})
     if sample_interval is not None:
         out = {topic: _downsample(samples, sample_interval) for topic, samples in out.items()}
+    rows = sum(len(samples) for samples in out.values())
     if format == "summary":
-        return {topic: summarize(samples) for topic, samples in out.items()}
+        out = {topic: summarize(samples) for topic, samples in out.items()}
+    if return_meta:
+        key = "summary" if format == "summary" else "topics"
+        return _meta_result(out, key, rows, total_rows)
     return out
 
 
@@ -472,12 +555,16 @@ async def main() -> int:
             args.quiet,
             f"connecting to NT server at {args.server_ip}:{args.server_port}...",
         )
-        manager.connect(
-            server_ip=args.server_ip,
-            server_port=args.server_port,
-            team_number=args.team,
-            identity=args.identity,
-        )
+        try:
+            manager.connect(
+                server_ip=args.server_ip,
+                server_port=args.server_port,
+                team_number=args.team,
+                identity=args.identity,
+            )
+        except NTConnectError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
         if not await _wait_for_connection(manager):
             print(
                 f"ERROR: failed to connect to NT server at "
