@@ -579,6 +579,9 @@ async def test_nt_nonblocking_recording_lifecycle(
     assert stop["rows"] >= len(FIXTURE_NAMES)
     assert stop["topic_count"] >= len(FIXTURE_NAMES)
     assert stop["duration_seconds"] >= 0.0
+    assert stop["duration_seconds"] == stop["capture_duration_seconds"]
+    assert stop["capture_started_at"] <= stop["capture_ended_at"]
+    assert stop["event_span_seconds"] >= 0.0
     assert "samples" not in stop
     assert os.path.isfile(stop["path"])
 
@@ -674,6 +677,9 @@ async def test_nt_get_recording_info(mcp_synced: None, tmp_path) -> None:
     assert info["total_samples"] >= len(FIXTURE_NAMES)
     assert info["topic_count"] >= len(FIXTURE_NAMES)
     assert info["duration_seconds"] >= 0.0
+    assert info["duration_seconds"] == info["capture_duration_seconds"]
+    assert info["duration_source"] == "capture"
+    assert info["event_span_seconds"] >= 0.0
     assert "modified_iso" in info
 
 
@@ -1009,6 +1015,12 @@ RECEIPT_KEYS = {
     "recording_id",
     "path",
     "duration_seconds",
+    "capture_started_at",
+    "capture_started_iso",
+    "capture_ended_at",
+    "capture_ended_iso",
+    "capture_duration_seconds",
+    "event_span_seconds",
     "rows",
     "topic_count",
     "topics",

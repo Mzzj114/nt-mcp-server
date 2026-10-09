@@ -263,7 +263,7 @@ async def test_reader_subscribe_offline_summary(
 async def test_reader_get_recording_info(
     manager: NTManager, tmp_path
 ) -> None:
-    """get_recording_info returns duration, sample count and topic count."""
+    """get_recording_info separates capture time from NT event time."""
     recorder = nt_recorder.Recorder(
         manager, output_dir=str(tmp_path), prefixes=["/SmartDashboard/"], duration=1.0
     )
@@ -273,6 +273,11 @@ async def test_reader_get_recording_info(
     assert info["total_samples"] >= len(FIXTURE_NAMES)
     assert info["topic_count"] >= len(FIXTURE_NAMES)
     assert info["duration_seconds"] >= 0.0
+    assert info["duration_seconds"] == info["capture_duration_seconds"]
+    assert info["duration_source"] == "capture"
+    assert info["capture_started_at"] <= info["capture_ended_at"]
+    assert info["event_span_seconds"] >= 0.0
+    assert (tmp_path / info["id"].replace(".ndjson", ".meta.json")).is_file()
     assert "modified_iso" in info
 
 
@@ -283,8 +288,13 @@ def test_reader_get_recording_info_ignores_zero_timestamps(tmp_path) -> None:
         file.write(json.dumps({"time": 0, "topic": "/x", "value": 1}) + "\n")
         file.write(json.dumps({"time": 1000.0, "topic": "/x", "value": 2}) + "\n")
         file.write(json.dumps({"time": 1017.5, "topic": "/x", "value": 3}) + "\n")
-    info = nt_recorder.get_recording_info(recording_id=recording.name, output_dir=str(tmp_path))
+    info = nt_recorder.get_recording_info(
+        recording_id=recording.name, output_dir=str(tmp_path)
+    )
     assert info["duration_seconds"] == pytest.approx(17.5, abs=0.01)
+    assert info["capture_duration_seconds"] is None
+    assert info["event_span_seconds"] == pytest.approx(17.5, abs=0.01)
+    assert info["duration_source"] == "event_span"
     assert info["total_samples"] == 3
     assert info["topic_count"] == 1
 
@@ -302,6 +312,8 @@ async def test_reader_list_recordings_and_most_recent_default(
     assert len(recordings) >= 1
     for entry in recordings:
         assert {"id", "path", "size_bytes", "modified", "modified_iso"} <= set(entry)
+        assert entry["capture_duration_seconds"] >= 0.0
+        assert entry["event_span_seconds"] >= 0.0
     history = nt_recorder.get_history(
         "/SmartDashboard/test_num", output_dir=str(tmp_path)
     )

@@ -42,7 +42,6 @@ _subscription_buffers: dict[str, list[dict[str, Any]]] = {}
 # and the NDJSON filename, so callers never need to rediscover the file.
 _recording_tasks: dict[str, asyncio.Task[str]] = {}
 _recorders: dict[str, nt_recorder.Recorder] = {}
-_recording_started: dict[str, float] = {}
 
 
 async def _consume_subscription(subscription_id: str, prefixes: list[str], buffer_size: int) -> None:
@@ -84,7 +83,6 @@ def _new_recording_id() -> str:
 def _recording_receipt(
     recorder: nt_recorder.Recorder,
     path: str,
-    duration_seconds: float,
 ) -> dict:
     """Build the compact, value-free receipt shared by recording tools."""
     topics = recorder.topics
@@ -92,13 +90,28 @@ def _recording_receipt(
         "output": "file",
         "recording_id": os.path.basename(path),
         "path": path,
-        "duration_seconds": duration_seconds,
+        "duration_seconds": recorder.capture_duration_seconds,
+        "capture_started_at": recorder.capture_started_at,
+        "capture_started_iso": _iso_timestamp(recorder.capture_started_at),
+        "capture_ended_at": recorder.capture_ended_at,
+        "capture_ended_iso": _iso_timestamp(recorder.capture_ended_at),
+        "capture_duration_seconds": recorder.capture_duration_seconds,
+        "event_span_seconds": recorder.event_span_seconds,
         "rows": recorder.rows,
         "topic_count": len(topics),
         "topics": topics[:_MAX_RECEIPT_TOPICS],
         "topics_truncated": len(topics) > _MAX_RECEIPT_TOPICS,
         "truncated": recorder.truncated,
     }
+
+
+def _iso_timestamp(unix_time: float | None) -> str | None:
+    """Return a UTC ISO timestamp for a capture-clock value."""
+    if unix_time is None:
+        return None
+    return datetime.datetime.fromtimestamp(
+        unix_time, tz=datetime.timezone.utc
+    ).isoformat()
 
 
 def _clip_topic_rows(
@@ -289,8 +302,9 @@ async def nt_subscribe(
     to ``"file"``: the same window is captured to an NDJSON recording
     (nt-recorder format, written into ``output_dir`` or
     ``NT_RECORDINGS_DIR``) and the response is a compact receipt —
-    ``recording_id``, ``path``, ``rows``, ``topic_count``, the first 50
-    ``topics`` and ``truncated`` — with NO sample values.
+    ``recording_id``, ``path``, capture-clock and event-span timing, ``rows``,
+    ``topic_count``, the first 50 ``topics`` and ``truncated`` — with NO
+    sample values.
     ``output="summary"`` returns min/max/mean/last per topic;
     ``output="samples"`` returns raw ``{topic: [{"time", "value"}, ...]}``.
     Both inline modes are bounded: ``limit`` caps each topic's samples,
@@ -338,7 +352,7 @@ async def nt_subscribe(
         path = await recorder.run()
         return {
             "connected": True,
-            **_recording_receipt(recorder, path, duration),
+            **_recording_receipt(recorder, path),
         }
     # Inline modes: collect raw samples, enforce the total row budget,
     # then reduce summaries from what survived the clip.
@@ -479,25 +493,29 @@ async def nt_start_recording(
     task = asyncio.create_task(recorder.run())
     _recorders[recording_id] = recorder
     _recording_tasks[recording_id] = task
-    _recording_started[recording_id] = time.monotonic()
     # Give run() a chance to create the file and surface immediate I/O errors.
     await asyncio.sleep(0)
     if task.done() and (error := task.exception()) is not None:
         _recorders.pop(recording_id, None)
         _recording_tasks.pop(recording_id, None)
-        _recording_started.pop(recording_id, None)
         return {
             "connected": manager.is_connected(),
             "recording_id": recording_id,
             "started": False,
             "error": str(error),
         }
-    return {
+    response = {
         "connected": True,
         "recording_id": recording_id,
         "path": os.path.join(dir_, recording_id),
         "started": True,
     }
+    if recorder.capture_started_at is not None:
+        response["capture_started_at"] = recorder.capture_started_at
+        response["capture_started_iso"] = _iso_timestamp(
+            recorder.capture_started_at
+        )
+    return response
 
 
 @mcp.tool()
@@ -513,7 +531,6 @@ async def nt_stop_recording(recording_id: str) -> dict:
             "error": f"no active recording with id {recording_id}",
         }
     recorder.stop_event.set()
-    started = _recording_started.get(recording_id, time.monotonic())
     try:
         path = await task
     except (IOError, OSError) as exc:
@@ -526,15 +543,10 @@ async def nt_stop_recording(recording_id: str) -> dict:
     finally:
         _recorders.pop(recording_id, None)
         _recording_tasks.pop(recording_id, None)
-        _recording_started.pop(recording_id, None)
     return {
         "connected": manager.is_connected(),
         "stopped": True,
-        **_recording_receipt(
-            recorder,
-            path,
-            max(0.0, time.monotonic() - started),
-        ),
+        **_recording_receipt(recorder, path),
     }
 
 
@@ -606,8 +618,9 @@ def nt_get_recording_info(
 ) -> dict:
     """Return metadata about a recording.
 
-    Includes duration, total sample count, topic count, file size and
-    timestamps.
+    Includes actual capture duration, NT event timestamp span, total sample
+    count, topic count, file size and timestamps. Legacy recordings without
+    a metadata sidecar explicitly fall back to their event span.
     """
     dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
     return nt_recorder.get_recording_info(recording_id, dir_)

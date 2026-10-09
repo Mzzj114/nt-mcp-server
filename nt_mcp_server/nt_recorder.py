@@ -49,7 +49,10 @@ class Recorder:
     both via the same ``StreamDecimator`` used by ``NTManager.subscribe``.
     ``max_capture_rows`` stops capture once that many rows are written.
     After ``run()``: ``rows`` (int), ``topics`` (sorted unique names written),
-    ``truncated`` (True only when the cap stopped capture early).
+    ``truncated`` (True only when the cap stopped capture early), plus actual
+    capture wall-clock and event-span metadata. Metadata is persisted in a
+    sibling ``.meta.json`` file so offline readers do not confuse stale NT
+    last-change timestamps with the capture duration.
     """
 
     def __init__(
@@ -72,11 +75,19 @@ class Recorder:
             sample_interval=sample_interval, change_only=change_only
         )
         self._max_capture_rows = max_capture_rows
+        self.sample_interval = sample_interval
+        self.change_only = change_only
         self.recording_id = recording_id
         self.rows = 0
         self._topics: set[str] = set()
         self.topics: list[str] = []
         self.truncated = False
+        self.capture_started_at: float | None = None
+        self.capture_ended_at: float | None = None
+        self.capture_duration_seconds: float | None = None
+        self.event_started_at: float | None = None
+        self.event_ended_at: float | None = None
+        self.event_span_seconds = 0.0
 
     async def run(self) -> str:
         """Subscribe, write events to NDJSON, return the output file path."""
@@ -85,26 +96,69 @@ class Recorder:
             datetime.timezone.utc
         ).strftime("nt-record-%Y-%m-%dT%H%M%SZ.ndjson")
         path = os.path.join(self.output_dir, filename)
-        with open(path, "w", encoding="utf-8") as file:
-            if self.duration is not None:
-                # asyncio.timeout fires at the generator's await point even
-                # when no events are flowing (bare time.monotonic checks
-                # inside the async for never regain control between events).
-                try:
-                    async with asyncio.timeout(self.duration):
-                        async for topic, value, time_seconds in (
-                            self.manager.subscribe_stream(self.prefixes)
-                        ):
-                            if not self._write_filtered(
-                                file, topic, value, time_seconds
+        started_monotonic: float | None = None
+        try:
+            with open(path, "w", encoding="utf-8") as file:
+                self.capture_started_at = time.time()
+                started_monotonic = time.monotonic()
+                if self.duration is not None:
+                    # asyncio.timeout fires at the generator's await point even
+                    # when no events are flowing (bare time.monotonic checks
+                    # inside the async for never regain control between events).
+                    try:
+                        async with asyncio.timeout(self.duration):
+                            async for topic, value, time_seconds in (
+                                self.manager.subscribe_stream(self.prefixes)
                             ):
-                                break
-                except TimeoutError:
-                    pass
-            else:
-                await self._run_until_stop(file)
-        self.topics = sorted(self._topics)
+                                if not self._write_filtered(
+                                    file, topic, value, time_seconds
+                                ):
+                                    break
+                    except TimeoutError:
+                        pass
+                else:
+                    await self._run_until_stop(file)
+        finally:
+            if started_monotonic is not None:
+                self.capture_ended_at = time.time()
+                self.capture_duration_seconds = max(
+                    0.0, time.monotonic() - started_monotonic
+                )
+            self.topics = sorted(self._topics)
+            if (
+                self.event_started_at is not None
+                and self.event_ended_at is not None
+            ):
+                self.event_span_seconds = max(
+                    0.0, self.event_ended_at - self.event_started_at
+                )
+            if self.capture_started_at is not None:
+                self._write_metadata(path)
         return path
+
+    def _write_metadata(self, path: str) -> None:
+        """Persist capture-clock metadata separately from the NDJSON events."""
+        metadata = {
+            "schema_version": 1,
+            "recording_id": os.path.basename(path),
+            "capture_started_at": self.capture_started_at,
+            "capture_started_iso": _iso_timestamp(self.capture_started_at),
+            "capture_ended_at": self.capture_ended_at,
+            "capture_ended_iso": _iso_timestamp(self.capture_ended_at),
+            "capture_duration_seconds": self.capture_duration_seconds,
+            "event_started_at": self.event_started_at,
+            "event_ended_at": self.event_ended_at,
+            "event_span_seconds": self.event_span_seconds,
+            "prefixes": self.prefixes,
+            "sample_interval": self.sample_interval,
+            "change_only": self.change_only,
+            "max_rows": self._max_capture_rows,
+            "rows": self.rows,
+            "topic_count": len(self.topics),
+            "truncated": self.truncated,
+        }
+        with open(_metadata_path(path), "w", encoding="utf-8") as file:
+            json.dump(metadata, file, separators=(",", ":"))
 
     async def _run_until_stop(self, file) -> None:
         """Consume the stream until ``stop_event`` is set."""
@@ -143,6 +197,14 @@ class Recorder:
         _write_event(file, topic, value, time_seconds)
         self.rows += 1
         self._topics.add(topic)
+        if time_seconds > 0:
+            if (
+                self.event_started_at is None
+                or time_seconds < self.event_started_at
+            ):
+                self.event_started_at = time_seconds
+            if self.event_ended_at is None or time_seconds > self.event_ended_at:
+                self.event_ended_at = time_seconds
         if self._max_capture_rows is not None and self.rows >= self._max_capture_rows:
             self.truncated = True
             return False
@@ -283,9 +345,35 @@ def _downsample(
     return out
 
 
-def _iso_timestamp(unix_time: float) -> str:
+def _iso_timestamp(unix_time: float | None) -> str | None:
     """Return a UTC ISO-8601 string for a Unix timestamp."""
-    return datetime.datetime.fromtimestamp(unix_time, tz=datetime.timezone.utc).isoformat()
+    if unix_time is None:
+        return None
+    return datetime.datetime.fromtimestamp(
+        unix_time, tz=datetime.timezone.utc
+    ).isoformat()
+
+
+def _metadata_path(recording_path: str) -> str:
+    """Return the sibling metadata path for an NDJSON recording."""
+    return os.path.splitext(recording_path)[0] + ".meta.json"
+
+
+def _read_capture_metadata(recording_path: str) -> dict[str, Any] | None:
+    """Read persisted capture metadata, returning None for legacy recordings."""
+    path = _metadata_path(recording_path)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            value = json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(
+            f"WARNING: could not read recording metadata {path}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def list_recordings(output_dir: str = "./recordings") -> list[dict]:
@@ -293,7 +381,8 @@ def list_recordings(output_dir: str = "./recordings") -> list[dict]:
 
     Returns a list of
     ``{"id": filename, "path": full_path, "size_bytes": int,
-    "modified": float, "modified_iso": str}`` for each ``.ndjson`` file.
+    "modified": float, "modified_iso": str}`` for each ``.ndjson`` file,
+    plus capture-clock and event-span fields when a metadata sidecar exists.
     If ``output_dir`` does not exist, returns ``[]``.
 
     Note: do not call reader functions on a recording currently being
@@ -309,15 +398,29 @@ def list_recordings(output_dir: str = "./recordings") -> list[dict]:
         if not os.path.isfile(full):
             continue
         stat = os.stat(full)
-        entries.append(
-            {
-                "id": name,
-                "path": full,
-                "size_bytes": stat.st_size,
-                "modified": stat.st_mtime,
-                "modified_iso": _iso_timestamp(stat.st_mtime),
-            }
-        )
+        entry = {
+            "id": name,
+            "path": full,
+            "size_bytes": stat.st_size,
+            "modified": stat.st_mtime,
+            "modified_iso": _iso_timestamp(stat.st_mtime),
+        }
+        metadata = _read_capture_metadata(full)
+        if metadata is not None:
+            entry.update(
+                {
+                    key: metadata.get(key)
+                    for key in (
+                        "capture_started_at",
+                        "capture_started_iso",
+                        "capture_ended_at",
+                        "capture_ended_iso",
+                        "capture_duration_seconds",
+                        "event_span_seconds",
+                    )
+                }
+            )
+        entries.append(entry)
     entries.sort(key=lambda r: r["modified"], reverse=True)
     return entries
 
@@ -448,15 +551,18 @@ def get_recording_info(
 ) -> dict:
     """Return metadata for a recording.
 
-    Includes ``duration_seconds``, ``total_samples``, ``topic_count``,
-    ``id``, ``path``, ``size_bytes``, ``modified`` and ``modified_iso``.
-    Missing file returns an ``error`` key.
+    New recordings report actual ``capture_duration_seconds`` separately
+    from ``event_span_seconds`` (the span of NT last-change timestamps), and
+    use capture time for the backward-compatible ``duration_seconds`` field.
+    Legacy recordings without a metadata sidecar use event span and report
+    ``duration_source="event_span"``. Also includes sample/topic counts and
+    ordinary file metadata. Missing files return an ``error`` key.
     """
     path = _resolve_recording(recording_id, output_dir)
     if path is None:
         return {"error": "no recording found"}
     bounds = _time_bounds(path)
-    duration = bounds[1] - bounds[0] if bounds else 0.0
+    event_span = bounds[1] - bounds[0] if bounds else 0.0
     total = 0
     topics: set[str] = set()
     for event in _iter_events(path):
@@ -465,16 +571,44 @@ def get_recording_info(
         if isinstance(topic, str):
             topics.add(topic)
     stat = os.stat(path)
-    return {
+    metadata = _read_capture_metadata(path)
+    capture_duration = (
+        metadata.get("capture_duration_seconds") if metadata is not None else None
+    )
+    result = {
         "id": os.path.basename(path),
         "path": path,
         "size_bytes": stat.st_size,
         "modified": stat.st_mtime,
         "modified_iso": _iso_timestamp(stat.st_mtime),
-        "duration_seconds": duration,
+        # Backward-compatible name: new recordings use actual capture time;
+        # legacy recordings fall back to their event timestamp span.
+        "duration_seconds": (
+            capture_duration if capture_duration is not None else event_span
+        ),
+        "capture_duration_seconds": capture_duration,
+        "event_span_seconds": event_span,
+        "duration_source": (
+            "capture" if capture_duration is not None else "event_span"
+        ),
         "total_samples": total,
         "topic_count": len(topics),
     }
+    if metadata is not None:
+        result.update(
+            {
+                key: metadata.get(key)
+                for key in (
+                    "capture_started_at",
+                    "capture_started_iso",
+                    "capture_ended_at",
+                    "capture_ended_iso",
+                    "event_started_at",
+                    "event_ended_at",
+                )
+            }
+        )
+    return result
 
 
 def subscribe_offline(

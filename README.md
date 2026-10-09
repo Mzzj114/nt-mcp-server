@@ -118,7 +118,7 @@ Options:
 - `--identity` — client identity string (default: `nt-recorder`)
 - `--quiet` — suppress status output to stderr
 
-Output files are named `nt-record-<YYYY-MM-DDTHHMMSSZ>.ndjson` (no colons, Windows-safe). Each line is `{"time": float, "topic": str, "value": jsonable}`. Exit codes: 0 clean, 1 connection failure, 2 disk/IO error.
+Output files use Windows-safe names such as `nt-record-<YYYY-MM-DDTHHMMSSZ>.ndjson`; nonblocking lifecycle captures add a short uniqueness suffix. Each NDJSON has a sibling `.meta.json` file containing actual capture-clock timing and the NT event timestamp span. Every NDJSON line is `{"time": float, "topic": str, "value": jsonable}`. Exit codes: 0 clean, 1 connection failure, 2 disk/IO error.
 
 > Run `uv cache prune` or `uv cache clear` if you don't want cache files to stay on your device after `uvx`.
 
@@ -150,6 +150,12 @@ Default `nt_subscribe` receipt (no sample values, a few hundred serialized chara
   "recording_id": "nt-record-2026-09-18T120000Z.ndjson",
   "path": "recordings\\nt-record-2026-09-18T120000Z.ndjson",
   "duration_seconds": 10.0,
+  "capture_started_at": 1789732800.0,
+  "capture_started_iso": "2026-09-18T12:00:00+00:00",
+  "capture_ended_at": 1789732810.0,
+  "capture_ended_iso": "2026-09-18T12:00:10+00:00",
+  "capture_duration_seconds": 10.0,
+  "event_span_seconds": 35.4,
   "rows": 214,
   "topic_count": 6,
   "topics": ["/SmartDashboard/gyro_angle", "/SmartDashboard/left_speed"],
@@ -158,7 +164,7 @@ Default `nt_subscribe` receipt (no sample values, a few hundred serialized chara
 }
 ```
 
-`topics` lists at most 50 names (`topics_truncated: true` when more exist); `rows` is the number of events written and `truncated` is true when the `max_rows` capture cap stopped recording early.
+`topics` lists at most 50 names (`topics_truncated: true` when more exist); `rows` is the number of events written and `truncated` is true when the `max_rows` capture cap stopped recording early. `duration_seconds` is the actual wall-clock capture duration (also named explicitly as `capture_duration_seconds`); `event_span_seconds` is the span of NT last-change timestamps and can be longer when immediate values predate the capture.
 | `nt_start_subscription` | Open a persistent subscription. Response: `{"connected": bool, "subscription_id": str, "started": bool}`. |
 | `nt_poll_subscription` | Read buffered samples from a persistent subscription. Response: `{"connected": bool, "samples": {topic: [...]}}`. |
 | `nt_stop_subscription` | Stop a persistent subscription. Response: `{"connected": bool, "stopped": bool}`. |
@@ -169,8 +175,8 @@ Default `nt_subscribe` receipt (no sample values, a few hundred serialized chara
 
 | Tool | Description |
 | --- | --- |
-| `nt_list_recordings` | List recordings. Each entry includes `id`, `path`, `size_bytes`, `modified` (Unix float), and `modified_iso` (UTC ISO-8601). |
-| `nt_get_recording_info` | Return duration, total sample count, topic count, and file metadata for a recording. |
+| `nt_list_recordings` | List recordings. Each entry includes file metadata plus persisted capture-clock and NT event-span timing when available. |
+| `nt_get_recording_info` | Return capture duration, event timestamp span, total sample count, topic count, and file metadata. Legacy recordings without a metadata sidecar report `duration_source="event_span"`. |
 | `nt_get_history` | Return event history for one topic. Supports `last_seconds`, `sample_interval`, and `format="summary"`. The response always states `rows` (entries returned), `total_rows` (all matching events, counted even past the clip), and `truncated` (`total_rows > rows`, or the 60,000-character ceiling dropped rows) so clipping is never silent. |
 | `nt_list_topics_offline` | List unique topic names in a recording, filtered by `prefix`, `regex`, and/or `wildcard`. |
 | `nt_subscribe_offline` | Return events for every topic under prefixes. Supports `last_seconds`, `sample_interval`, and `format="summary"`. `limit` (default 1000 per topic) and `max_rows` (default 5000 total) bound the payload; like `nt_get_history`, the response always states `rows` / `total_rows` / `truncated`. A bare `"/"` prefix is refused — narrow it (e.g. `/SmartDashboard/`) or use the `nt-recorder` CLI to dump a whole recording. |
