@@ -1,58 +1,43 @@
 # nt-mcp-server
 
-A standalone MCP server for reading, writing, and monitoring FRC NetworkTables data. It lets an AI agent talk to a robot's network tables over the NetworkTables protocol. The primary target is the local RobotPy sim (`python -m robotpy sim` on `127.0.0.1:5810`).
+> **What is a MCP?**
+> The Model Context Protocol (MCP) is a standard way for AI agents to use external tools and data. The concept is established by Anthropic researchers in the end of 2024.
+> For more information, see [https://modelcontextprotocol.io/](https://modelcontextprotocol.io/).
 
-pinned dependencies (`fastmcp==3.4.7`, `pyntcore==2026.2.2`).
+This server exposes FIRST Robotics Competition (FRC) NetworkTables through MCP, so a coding agent can inspect telemetry, diagnose robot behavior, and test values without manually copying data between the robot, dashboards, and code.
 
-## Run the server
+It works with a local RobotPy simulation by default and can also connect to a real robot.
 
-```powershell
-uv run nt-mcp-server
-```
+> **How do I use AI while connecting to the Robot Wifi?**
+> Obviously Robot Wifi doesn't provide Internet access, so you can't call LLM. The key is to use TWO network adapters: one for the Robot Wifi, another for Internet access. 
+> The first network adapter is usually the one inside your device that you always use to go online. For the second one, your laptop may have a Ethernet port, you can therefore connect a Ethernet cable to the `DS` port of the robot radio. In other cases, you may want a USB-to-Ethernet adapter or a USB wireless network adapter.
+> The connections should be ready to go now. Rarely you need to configure the routing table of your device to explicitly guide traffic targeting the robot IP to the correct network adapter.
 
-Or, equivalently, from a checkout without uv's shim:
+## Register with an agent
 
-```powershell
-python -m nt_mcp_server
-```
+The package can run directly from Git with `uvx`, so no checkout or pre-built virtual environment is required. Install [uv](https://docs.astral.sh/uv/) first, then use the setup for your agent.
 
-The server runs on stdio, which is how MCP clients (like opencode) talk to it.
-
-## Connect to RobotPy sim NetworkTables
-
-The sim must be running before the server can read or write anything useful. Start it from its own project and venv:
+### Codex
 
 ```powershell
-cd <path-to-try-robotpy> && .venv\Scripts\activate && python -m robotpy sim
+codex mcp add nt -- uvx --from git+https://github.com/Mzzj114/nt-mcp-server.git nt-mcp-server
+codex mcp list
 ```
 
-The server connects to `127.0.0.1:5810` by default, which is where the sim listens.
-
-## Connect to Real Robot NetworkTables
-
-For most cases, just record NetworkTables and use the mcp to analyze the recordings.
-
-If you want to connect to a real robot's NetworkTables in real time, you need to have 2 network adapters on you device: one for Internet and the other for robot communication. One approach is to use your wireless adapter to connect to the wifi and use a ethernet cable to connect to the robot. Alternatively, you get a USB Network Adapter as the second adapter. In ethier cases, you may need to configure your device's network routing.
-
-## Register in any agent
-
-The server is a uvx-runnable package from git, so any MCP client can launch it without a local checkout or a pre-built venv. Run it on demand:
+### Claude Code
 
 ```powershell
-uvx --from git+https://github.com/Mzzj114/nt-mcp-server.git nt-mcp-server
+claude mcp add --scope project nt -- uvx --from git+https://github.com/Mzzj114/nt-mcp-server.git nt-mcp-server
+claude mcp list
 ```
 
-Or install the console script once and run it anywhere:
+### OpenCode
 
-```powershell
-uv tool install "git+https://github.com/Mzzj114/nt-mcp-server.git"
-uvx nt-mcp-server
-```
+Add the server to the project's `opencode.jsonc`:
 
-Add this entry to your agent's MCP config (shown here as opencode's project-level `opencode.jsonc`):
-
-```json
+```jsonc
 {
+  "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "nt": {
       "type": "local",
@@ -68,59 +53,7 @@ Add this entry to your agent's MCP config (shown here as opencode's project-leve
 }
 ```
 
-Verify with `opencode mcp list` from the project root: the `nt` server should show as connected.
-
-### Load the nt-mcp-workflow skill
-
-The repo ships an agent skill at `skills/nt-mcp-workflow/` that teaches an agent how to run a NetworkTables investigation (live, offline replay, and recording). opencode does **not** scan a project-local `.agents/skills` directory — it only auto-loads `~/.agents/skills`, `~/.claude/skills`, project `.opencode/skill(s)/`, and directories listed under explicit `skills.paths`. Add this block to your `opencode.jsonc` (same file as the `mcp` entry above):
-
-```json
-{
-  "skills": {
-    "paths": ["../nt-mcp-server/skills"]
-  }
-}
-```
-
-The relative path resolves against the directory containing the config file, so adjust it to wherever your checkout of this repo sits relative to that config. opencode scans `skills.paths` recursively for `**/SKILL.md`, so pointing at the repo's `skills` directory exposes `nt-mcp-workflow`.
-
-> opencode loads its config once at startup and does **not** hot-reload — restart opencode after editing the config for the skill to appear.
-
-## Record NetworkTables to NDJSON (offline)
-
-The `nt-recorder` CLI connects to a live NT4 server and writes value events to a timestamped `.ndjson` file. It runs on the dev laptop and reads NT from the sim or robot; no robot-side changes are needed.
-
-```powershell
-uv run nt-recorder --prefixes /SmartDashboard/ --output-dir recordings
-```
-
-Or, with no local checkout, run it straight from git via uvx (same source as the server):
-
-```powershell
-uvx --from git+https://github.com/Mzzj114/nt-mcp-server.git nt-recorder --prefixes /SmartDashboard/ --output-dir recordings
-```
-
-Or install the tool once so both `nt-mcp-server` and `nt-recorder` are on PATH, then run either without re-fetching:
-
-```powershell
-uv tool install "git+https://github.com/Mzzj114/nt-mcp-server.git"
-nt-recorder --prefixes /SmartDashboard/ --output-dir recordings
-```
-
-The recorder is a standalone console script, independent of the MCP server — running the server via uvx does not start it, and the agent does not need to be connected to record.
-
-Options:
-- `--prefixes` — topic prefixes to subscribe to (default: `/`)
-- `--output-dir` — directory for output files (default: `./recordings`)
-- `--duration` — record for N seconds, then exit (default: run until Ctrl+C)
-- `--team` — connect via team number instead of server IP/port
-- `--server-ip` / `--server-port` — NT4 server address (default: `127.0.0.1:5810`)
-- `--identity` — client identity string (default: `nt-recorder`)
-- `--quiet` — suppress status output to stderr
-
-Output files use Windows-safe names such as `nt-record-<YYYY-MM-DDTHHMMSSZ>.ndjson`; nonblocking lifecycle captures add a short uniqueness suffix. Each NDJSON has a sibling `.meta.json` file containing actual capture-clock timing and the NT event timestamp span. Every NDJSON line is `{"time": float, "topic": str, "value": jsonable}`. Exit codes: 0 clean, 1 connection failure, 2 disk/IO error.
-
-> Run `uv cache prune` or `uv cache clear` if you don't want cache files to stay on your device after `uvx`.
+Verify the connection with `opencode mcp list`.
 
 ## Tools
 
@@ -140,31 +73,6 @@ The server exposes 20 tools (15 live + 5 offline). Every live tool response incl
 | `nt_set_multiple` | Write every `{topic: value}` pair. Response: `{"connected": bool, "results": {...}, "warnings": {...}}`. |
 | `nt_list_topics` | List topic names, filtered by `prefix`, `regex`, and/or `wildcard`. Response: `{"connected": bool, "topics": [...]}`. |
 | `nt_subscribe` | Sample selected updates for `duration` seconds. Select with `prefixes`, exact `topics`, `regex`, and/or `wildcard`; values within a list are ORed and selector kinds are ANDed. `output` defaults to `"file"`, which writes NDJSON and returns a compact receipt with **no sample values**. Inline `"summary"` / `"samples"` modes are bounded by per-topic `limit`, total `max_rows` (default 5000), and a 60,000-character ceiling. An unqualified bare `"/"` is refused inline, while `"/"` combined with another narrowing selector is allowed. `sample_interval` and `change_only` decimate events. |
-
-Default `nt_subscribe` receipt (no sample values, a few hundred serialized characters, far under the 20,000-character budget):
-
-```json
-{
-  "connected": true,
-  "output": "file",
-  "recording_id": "nt-record-2026-09-18T120000Z.ndjson",
-  "path": "recordings\\nt-record-2026-09-18T120000Z.ndjson",
-  "duration_seconds": 10.0,
-  "capture_started_at": 1789732800.0,
-  "capture_started_iso": "2026-09-18T12:00:00+00:00",
-  "capture_ended_at": 1789732810.0,
-  "capture_ended_iso": "2026-09-18T12:00:10+00:00",
-  "capture_duration_seconds": 10.0,
-  "event_span_seconds": 35.4,
-  "rows": 214,
-  "topic_count": 6,
-  "topics": ["/SmartDashboard/gyro_angle", "/SmartDashboard/left_speed"],
-  "topics_truncated": false,
-  "truncated": false
-}
-```
-
-`topics` lists at most 50 names (`topics_truncated: true` when more exist); `rows` is the number of events written and `truncated` is true when the `max_rows` capture cap stopped recording early. `duration_seconds` is the actual wall-clock capture duration (also named explicitly as `capture_duration_seconds`); `event_span_seconds` is the span of NT last-change timestamps and can be longer when immediate values predate the capture.
 | `nt_start_subscription` | Open a persistent subscription using `prefixes`, exact `topics`, `regex`, and/or `wildcard`. Response: `{"connected": bool, "subscription_id": str, "started": bool}`. |
 | `nt_poll_subscription` | Read buffered samples from a persistent subscription. Response: `{"connected": bool, "samples": {topic: [...]}}`. |
 | `nt_stop_subscription` | Stop a persistent subscription. Response: `{"connected": bool, "stopped": bool}`. |
@@ -189,6 +97,29 @@ The `nt-recorder` CLI also supports `--team N` to connect via team number; the M
 
 - Python 3.14.0 venv in `.venv`; deps installed from `requirements.txt` (`fastmcp==3.4.7`, `pyntcore==2026.2.2`).
 - Tests: `uv run pytest tests/ -v`
+
+To run the mcp server by yourself from a local checkout, start the stdio MCP server with:
+
+```powershell
+uv run nt-mcp-server
+```
+
+Equivalent Python entry point:
+
+```powershell
+python -m nt_mcp_server
+```
+
+For RobotPy simulation, start the simulator from the robot project:
+
+```powershell
+python -m robotpy sim
+```
+
+Then use `nt_connect` with its defaults to connect to `127.0.0.1:5810`.
+
+For a real robot, connect the development machine to the robot network and call `nt_connect` with `team_number`. If the agent also needs Internet access, use separate network adapters—for example, Wi-Fi for Internet and Ethernet or a USB network adapter for the robot—and configure routing if needed.
+
 
 ## Release notes
 
