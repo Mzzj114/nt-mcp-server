@@ -8,6 +8,7 @@ lives in the manager. Run with ``uv run nt-mcp-server`` or
 
 import asyncio
 import contextlib
+import datetime
 import os
 import time
 import uuid
@@ -37,6 +38,12 @@ _MAX_RECEIPT_TOPICS = 50
 _subscription_tasks: dict[str, asyncio.Task] = {}
 _subscription_buffers: dict[str, list[dict[str, Any]]] = {}
 
+# Nonblocking file recordings. The recording id is both the public handle
+# and the NDJSON filename, so callers never need to rediscover the file.
+_recording_tasks: dict[str, asyncio.Task[str]] = {}
+_recorders: dict[str, nt_recorder.Recorder] = {}
+_recording_started: dict[str, float] = {}
+
 
 async def _consume_subscription(subscription_id: str, prefixes: list[str], buffer_size: int) -> None:
     """Consume the stream for ``subscription_id`` into its buffer."""
@@ -58,6 +65,40 @@ def _stop_all_subscriptions() -> None:
             task.cancel()
     _subscription_tasks.clear()
     _subscription_buffers.clear()
+
+
+def _request_stop_all_recordings() -> None:
+    """Ask active recorders to close without blocking this sync callback."""
+    for recorder in _recorders.values():
+        recorder.stop_event.set()
+
+
+def _new_recording_id() -> str:
+    """Return a Windows-safe id unique even for starts in the same second."""
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H%M%SZ"
+    )
+    return f"nt-record-{timestamp}-{uuid.uuid4().hex[:8]}.ndjson"
+
+
+def _recording_receipt(
+    recorder: nt_recorder.Recorder,
+    path: str,
+    duration_seconds: float,
+) -> dict:
+    """Build the compact, value-free receipt shared by recording tools."""
+    topics = recorder.topics
+    return {
+        "output": "file",
+        "recording_id": os.path.basename(path),
+        "path": path,
+        "duration_seconds": duration_seconds,
+        "rows": recorder.rows,
+        "topic_count": len(topics),
+        "topics": topics[:_MAX_RECEIPT_TOPICS],
+        "topics_truncated": len(topics) > _MAX_RECEIPT_TOPICS,
+        "truncated": recorder.truncated,
+    }
 
 
 def _clip_topic_rows(
@@ -134,6 +175,7 @@ async def nt_connect(
 def nt_disconnect() -> dict:
     """Stop the NT4 client and tear down any persistent subscriptions."""
     _stop_all_subscriptions()
+    _request_stop_all_recordings()
     manager.disconnect()
     return {"connected": False, "status": "disconnected"}
 
@@ -294,18 +336,9 @@ async def nt_subscribe(
             max_capture_rows=max_rows,
         )
         path = await recorder.run()
-        topics = recorder.topics
         return {
             "connected": True,
-            "output": "file",
-            "recording_id": os.path.basename(path),
-            "path": path,
-            "duration_seconds": duration,
-            "rows": recorder.rows,
-            "topic_count": len(topics),
-            "topics": topics[:_MAX_RECEIPT_TOPICS],
-            "topics_truncated": len(topics) > _MAX_RECEIPT_TOPICS,
-            "truncated": recorder.truncated,
+            **_recording_receipt(recorder, path, duration),
         }
     # Inline modes: collect raw samples, enforce the total row budget,
     # then reduce summaries from what survived the clip.
@@ -413,6 +446,96 @@ async def nt_stop_subscription(subscription_id: str) -> dict:
         with contextlib.suppress(asyncio.CancelledError):
             await task
     return {"connected": manager.is_connected(), "stopped": True}
+
+
+@mcp.tool()
+async def nt_start_recording(
+    prefixes: list[str],
+    sample_interval: float | None = None,
+    change_only: float | None = None,
+    max_rows: int = 5000,
+    output_dir: str | None = None,
+) -> dict:
+    """Start an NDJSON recording and return its id immediately.
+
+    Use ``nt_stop_recording(recording_id)`` after the human-controlled test
+    window. The stop call closes the file and returns the compact receipt;
+    do not use offline readers before it reports ``stopped: true``.
+    """
+    if not manager.is_connected():
+        return {"connected": False, "error": "NT server disconnected"}
+    dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
+    recording_id = _new_recording_id()
+    recorder = nt_recorder.Recorder(
+        manager,
+        output_dir=dir_,
+        prefixes=prefixes,
+        duration=None,
+        sample_interval=sample_interval,
+        change_only=change_only,
+        max_capture_rows=max_rows,
+        recording_id=recording_id,
+    )
+    task = asyncio.create_task(recorder.run())
+    _recorders[recording_id] = recorder
+    _recording_tasks[recording_id] = task
+    _recording_started[recording_id] = time.monotonic()
+    # Give run() a chance to create the file and surface immediate I/O errors.
+    await asyncio.sleep(0)
+    if task.done() and (error := task.exception()) is not None:
+        _recorders.pop(recording_id, None)
+        _recording_tasks.pop(recording_id, None)
+        _recording_started.pop(recording_id, None)
+        return {
+            "connected": manager.is_connected(),
+            "recording_id": recording_id,
+            "started": False,
+            "error": str(error),
+        }
+    return {
+        "connected": True,
+        "recording_id": recording_id,
+        "path": os.path.join(dir_, recording_id),
+        "started": True,
+    }
+
+
+@mcp.tool()
+async def nt_stop_recording(recording_id: str) -> dict:
+    """Stop a nonblocking recording and return its compact file receipt."""
+    recorder = _recorders.get(recording_id)
+    task = _recording_tasks.get(recording_id)
+    if recorder is None or task is None:
+        return {
+            "connected": manager.is_connected(),
+            "recording_id": recording_id,
+            "stopped": False,
+            "error": f"no active recording with id {recording_id}",
+        }
+    recorder.stop_event.set()
+    started = _recording_started.get(recording_id, time.monotonic())
+    try:
+        path = await task
+    except (IOError, OSError) as exc:
+        return {
+            "connected": manager.is_connected(),
+            "recording_id": recording_id,
+            "stopped": False,
+            "error": str(exc),
+        }
+    finally:
+        _recorders.pop(recording_id, None)
+        _recording_tasks.pop(recording_id, None)
+        _recording_started.pop(recording_id, None)
+    return {
+        "connected": manager.is_connected(),
+        "stopped": True,
+        **_recording_receipt(
+            recorder,
+            path,
+            max(0.0, time.monotonic() - started),
+        ),
+    }
 
 
 @mcp.tool()

@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
@@ -552,6 +553,37 @@ async def test_nt_persistent_subscription(mcp_synced: None) -> None:
     assert stop["stopped"] is True
 
     missing = nt_mcp_server.nt_poll_subscription(sub_id)
+    assert "error" in missing
+
+
+@pytest.mark.anyio
+async def test_nt_nonblocking_recording_lifecycle(
+    mcp_synced: None, tmp_path
+) -> None:
+    """A recording can span user turns and returns a receipt when stopped."""
+    start = await nt_mcp_server.nt_start_recording(
+        ["/SmartDashboard/"], output_dir=str(tmp_path)
+    )
+    assert start["connected"] is True
+    assert start["started"] is True
+    recording_id = start["recording_id"]
+    assert start["path"] == str(tmp_path / recording_id)
+
+    await asyncio.sleep(0.5)
+
+    stop = await nt_mcp_server.nt_stop_recording(recording_id)
+    assert stop["connected"] is True
+    assert stop["stopped"] is True
+    assert stop["recording_id"] == recording_id
+    assert stop["output"] == "file"
+    assert stop["rows"] >= len(FIXTURE_NAMES)
+    assert stop["topic_count"] >= len(FIXTURE_NAMES)
+    assert stop["duration_seconds"] >= 0.0
+    assert "samples" not in stop
+    assert os.path.isfile(stop["path"])
+
+    missing = await nt_mcp_server.nt_stop_recording(recording_id)
+    assert missing["stopped"] is False
     assert "error" in missing
 
 

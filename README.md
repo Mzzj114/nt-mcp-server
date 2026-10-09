@@ -124,7 +124,7 @@ Output files are named `nt-record-<YYYY-MM-DDTHHMMSSZ>.ndjson` (no colons, Windo
 
 ## Tools
 
-The server exposes 18 tools (13 live + 5 offline). Every live tool response includes a `connected` flag.
+The server exposes 20 tools (15 live + 5 offline). Every live tool response includes a `connected` flag.
 
 ### Live tools
 
@@ -162,6 +162,8 @@ Default `nt_subscribe` receipt (no sample values, a few hundred serialized chara
 | `nt_start_subscription` | Open a persistent subscription. Response: `{"connected": bool, "subscription_id": str, "started": bool}`. |
 | `nt_poll_subscription` | Read buffered samples from a persistent subscription. Response: `{"connected": bool, "samples": {topic: [...]}}`. |
 | `nt_stop_subscription` | Stop a persistent subscription. Response: `{"connected": bool, "stopped": bool}`. |
+| `nt_start_recording` | Start a nonblocking NDJSON recording and immediately return its `recording_id`; intended for human-controlled test windows. |
+| `nt_stop_recording` | Close a nonblocking recording and return the same compact, value-free receipt as file-mode `nt_subscribe`. |
 
 ### Offline recording tools
 

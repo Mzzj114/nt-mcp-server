@@ -61,6 +61,7 @@ class Recorder:
         sample_interval: float | None = None,
         change_only: float | None = None,
         max_capture_rows: int | None = None,
+        recording_id: str | None = None,
     ) -> None:
         self.manager = manager
         self.output_dir = output_dir
@@ -71,6 +72,7 @@ class Recorder:
             sample_interval=sample_interval, change_only=change_only
         )
         self._max_capture_rows = max_capture_rows
+        self.recording_id = recording_id
         self.rows = 0
         self._topics: set[str] = set()
         self.topics: list[str] = []
@@ -79,9 +81,9 @@ class Recorder:
     async def run(self) -> str:
         """Subscribe, write events to NDJSON, return the output file path."""
         os.makedirs(self.output_dir, exist_ok=True)
-        filename = datetime.datetime.now(datetime.timezone.utc).strftime(
-            "nt-record-%Y-%m-%dT%H%M%SZ.ndjson"
-        )
+        filename = self.recording_id or datetime.datetime.now(
+            datetime.timezone.utc
+        ).strftime("nt-record-%Y-%m-%dT%H%M%SZ.ndjson")
         path = os.path.join(self.output_dir, filename)
         with open(path, "w", encoding="utf-8") as file:
             if self.duration is not None:
