@@ -139,7 +139,7 @@ The server exposes 20 tools (15 live + 5 offline). Every live tool response incl
 | `nt_set` | Publish a value. Response: `{"connected": bool, "ok": bool, "warning": str \| null}`. Add `strict_type_check=True` to refuse type mismatches. |
 | `nt_set_multiple` | Write every `{topic: value}` pair. Response: `{"connected": bool, "results": {...}, "warnings": {...}}`. |
 | `nt_list_topics` | List topic names, filtered by `prefix`, `regex`, and/or `wildcard`. Response: `{"connected": bool, "topics": [...]}`. |
-| `nt_subscribe` | Sample updates under prefixes for `duration` seconds. **Breaking change:** the `format` parameter was removed in favour of `output`, which defaults to `"file"` — the same window is captured to an NDJSON recording (nt-recorder format, written into `output_dir` or `NT_RECORDINGS_DIR`) and the response is a compact receipt with **no sample values**. Inline modes: `output="summary"` returns min/max/mean/last per topic; `output="samples"` returns raw `{topic: [{"time", "value"}, ...]}`. Both inline modes are bounded by `limit` (per-topic), `max_rows` (total, default 5000), and a final 60,000-character ceiling — every drop states `truncated: true`. Inline modes refuse a bare `"/"` prefix; `output="file"` accepts it. `sample_interval` decimates events to one per topic per interval; `change_only` skips numeric changes at or below the threshold. |
+| `nt_subscribe` | Sample selected updates for `duration` seconds. Select with `prefixes`, exact `topics`, `regex`, and/or `wildcard`; values within a list are ORed and selector kinds are ANDed. `output` defaults to `"file"`, which writes NDJSON and returns a compact receipt with **no sample values**. Inline `"summary"` / `"samples"` modes are bounded by per-topic `limit`, total `max_rows` (default 5000), and a 60,000-character ceiling. An unqualified bare `"/"` is refused inline, while `"/"` combined with another narrowing selector is allowed. `sample_interval` and `change_only` decimate events. |
 
 Default `nt_subscribe` receipt (no sample values, a few hundred serialized characters, far under the 20,000-character budget):
 
@@ -165,10 +165,10 @@ Default `nt_subscribe` receipt (no sample values, a few hundred serialized chara
 ```
 
 `topics` lists at most 50 names (`topics_truncated: true` when more exist); `rows` is the number of events written and `truncated` is true when the `max_rows` capture cap stopped recording early. `duration_seconds` is the actual wall-clock capture duration (also named explicitly as `capture_duration_seconds`); `event_span_seconds` is the span of NT last-change timestamps and can be longer when immediate values predate the capture.
-| `nt_start_subscription` | Open a persistent subscription. Response: `{"connected": bool, "subscription_id": str, "started": bool}`. |
+| `nt_start_subscription` | Open a persistent subscription using `prefixes`, exact `topics`, `regex`, and/or `wildcard`. Response: `{"connected": bool, "subscription_id": str, "started": bool}`. |
 | `nt_poll_subscription` | Read buffered samples from a persistent subscription. Response: `{"connected": bool, "samples": {topic: [...]}}`. |
 | `nt_stop_subscription` | Stop a persistent subscription. Response: `{"connected": bool, "stopped": bool}`. |
-| `nt_start_recording` | Start a nonblocking NDJSON recording and immediately return its `recording_id`; intended for human-controlled test windows. |
+| `nt_start_recording` | Start a nonblocking NDJSON recording with the same topic selectors and immediately return its `recording_id`; intended for human-controlled test windows. |
 | `nt_stop_recording` | Close a nonblocking recording and return the same compact, value-free receipt as file-mode `nt_subscribe`. |
 
 ### Offline recording tools
@@ -179,7 +179,7 @@ Default `nt_subscribe` receipt (no sample values, a few hundred serialized chara
 | `nt_get_recording_info` | Return capture duration, event timestamp span, total sample count, topic count, and file metadata. Legacy recordings without a metadata sidecar report `duration_source="event_span"`. |
 | `nt_get_history` | Return event history for one topic. Supports `last_seconds`, `sample_interval`, and `format="summary"`. The response always states `rows` (entries returned), `total_rows` (all matching events, counted even past the clip), and `truncated` (`total_rows > rows`, or the 60,000-character ceiling dropped rows) so clipping is never silent. |
 | `nt_list_topics_offline` | List unique topic names in a recording, filtered by `prefix`, `regex`, and/or `wildcard`. |
-| `nt_subscribe_offline` | Return events for every topic under prefixes. Supports `last_seconds`, `sample_interval`, and `format="summary"`. `limit` (default 1000 per topic) and `max_rows` (default 5000 total) bound the payload; like `nt_get_history`, the response always states `rows` / `total_rows` / `truncated`. A bare `"/"` prefix is refused — narrow it (e.g. `/SmartDashboard/`) or use the `nt-recorder` CLI to dump a whole recording. |
+| `nt_subscribe_offline` | Return recorded events selected by `prefixes`, exact `topics`, `regex`, and/or `wildcard`. Supports `last_seconds`, `sample_interval`, and `format="summary"`. `limit` (default 1000 per topic), `max_rows` (default 5000 total), and the character ceiling bound the payload; `rows` / `total_rows` / `truncated` make clipping visible. |
 
 The offline tools read from the directory set by the `NT_RECORDINGS_DIR` environment variable (defaults to `./recordings`). Recordings are local-only — the recorder runs on the dev laptop and reads NT from the sim/robot; no robot-side changes are needed.
 

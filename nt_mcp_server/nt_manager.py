@@ -17,7 +17,7 @@ from typing import Any
 
 import ntcore
 
-from .nt_types import array_kind, summarize, to_jsonable, type_warning
+from .nt_types import TopicSelector, array_kind, summarize, to_jsonable, type_warning
 
 try:  # assert_never: typing on 3.11+, typing_extensions on 3.10
     from typing import assert_never
@@ -433,18 +433,29 @@ class NTManager:
         return {"results": results, "warnings": warnings}
 
     async def subscribe_stream(
-        self, prefixes: list[str]
+        self,
+        prefixes: list[str] | None = None,
+        topics: list[str] | None = None,
+        regex: str | None = None,
+        wildcard: str | None = None,
     ) -> AsyncIterator[tuple[str, Any, float]]:
-        """Yield ``(topic, value, time_seconds)`` for every value update under ``prefixes``.
+        """Yield matching ``(topic, value, time_seconds)`` updates.
 
         Runs indefinitely until the consumer stops iterating. Each stream
         owns its own ``MultiSubscriber`` and ``NetworkTableListenerPoller``
         (fresh per call; never reused from ``self``); both are closed in a
         ``finally`` block when the generator is closed. ``kImmediate`` emits
         the current value once per topic, then ``kValueAll`` on every change.
+        Prefix and exact-topic lists are ORed internally; different selector
+        kinds are ANDed. At least one selector kind is required.
         """
+        selector = TopicSelector(prefixes, topics, regex, wildcard)
+        if selector.empty:
+            raise ValueError("at least one topic selector is required")
         inst = self._instance()
-        subscriber = ntcore.MultiSubscriber(inst, prefixes, ntcore.PubSubOptions())
+        subscriber = ntcore.MultiSubscriber(
+            inst, selector.subscription_prefixes, ntcore.PubSubOptions()
+        )
         poller = ntcore.NetworkTableListenerPoller(inst)
         poller.addListener(
             subscriber, ntcore.EventFlags.kValueAll | ntcore.EventFlags.kImmediate
@@ -455,8 +466,11 @@ class NTManager:
                 if events:
                     for event in events:
                         data = event.data
+                        topic = data.topic.getName()
+                        if not selector.matches(topic):
+                            continue
                         yield (
-                            data.topic.getName(),
+                            topic,
                             to_jsonable(data.value.value()),
                             data.value.last_change() / 1_000_000.0,
                         )
@@ -468,14 +482,17 @@ class NTManager:
 
     async def subscribe(
         self,
-        prefixes: list[str],
+        prefixes: list[str] | None = None,
         duration: float = 10.0,
         sample_interval: float | None = None,
         change_only: float | None = None,
         format: str = "samples",
         limit: int | None = None,
+        topics: list[str] | None = None,
+        regex: str | None = None,
+        wildcard: str | None = None,
     ) -> dict[str, Any]:
-        """Sample value updates under ``prefixes`` for ``duration`` s.
+        """Sample selected value updates for ``duration`` seconds.
 
         Returns ``{topic: samples | summary}``. Each sample is
         ``{"time": float_s, "value": jsonable}``. ``sample_interval``
@@ -498,7 +515,9 @@ class NTManager:
         )
         try:
             async with asyncio.timeout(duration):
-                async for topic, value, time_seconds in self.subscribe_stream(prefixes):
+                async for topic, value, time_seconds in self.subscribe_stream(
+                    prefixes, topics, regex, wildcard
+                ):
                     if not decimator.keep(topic, value, time_seconds):
                         continue
                     results.setdefault(topic, []).append(

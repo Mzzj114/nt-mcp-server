@@ -388,6 +388,60 @@ async def test_nt_subscribe_unknown_output_rejected(mcp_synced: None) -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("selectors", "expected"),
+    [
+        (
+            {"topics": ["/SmartDashboard/test_num"]},
+            {"/SmartDashboard/test_num"},
+        ),
+        (
+            {"regex": r"test_(num|str)$"},
+            {"/SmartDashboard/test_num", "/SmartDashboard/test_str"},
+        ),
+        (
+            {"wildcard": "/SmartDashboard/test_arr"},
+            {"/SmartDashboard/test_arr"},
+        ),
+    ],
+)
+async def test_nt_subscribe_rich_topic_selectors(
+    mcp_synced: None, selectors: dict, expected: set[str]
+) -> None:
+    """Live subscriptions accept exact topics, regex, and wildcard filters."""
+    response = await nt_mcp_server.nt_subscribe(
+        duration=0.5,
+        output="summary",
+        **selectors,
+    )
+    assert response["connected"] is True
+    assert "error" not in response
+    assert set(response["samples"]) == expected
+
+
+@pytest.mark.anyio
+async def test_nt_subscribe_selector_validation(mcp_synced: None) -> None:
+    """Missing and malformed selectors return compact structured errors."""
+    missing = await nt_mcp_server.nt_subscribe(
+        duration=0.1, output="summary"
+    )
+    assert "at least one topic selector" in missing["error"]
+
+    invalid = await nt_mcp_server.nt_subscribe(
+        regex="[", duration=0.1, output="summary"
+    )
+    assert "invalid topic regex" in invalid["error"]
+
+    narrowed_root = await nt_mcp_server.nt_subscribe(
+        prefixes=["/"],
+        regex=r"/SmartDashboard/test_num$",
+        duration=0.5,
+        output="summary",
+    )
+    assert set(narrowed_root["samples"]) == {"/SmartDashboard/test_num"}
+
+
+@pytest.mark.anyio
 async def test_nt_set_type_warning(mcp_synced: None) -> None:
     """Writing wrong type to a known topic produces a warning.
 
@@ -536,7 +590,9 @@ async def test_nt_connect_timeout_reports_diagnostics(mcp_synced: None) -> None:
 @pytest.mark.anyio
 async def test_nt_persistent_subscription(mcp_synced: None) -> None:
     """Persistent subscriptions can be started, polled, and stopped."""
-    start = await nt_mcp_server.nt_start_subscription(["/SmartDashboard/"])
+    start = await nt_mcp_server.nt_start_subscription(
+        topics=["/SmartDashboard/test_num"]
+    )
     assert start["connected"] is True
     assert start["started"] is True
     sub_id = start["subscription_id"]
@@ -546,7 +602,7 @@ async def test_nt_persistent_subscription(mcp_synced: None) -> None:
 
     poll = nt_mcp_server.nt_poll_subscription(sub_id)
     assert poll["connected"] is True
-    assert "/SmartDashboard/test_num" in poll["samples"]
+    assert set(poll["samples"]) == {"/SmartDashboard/test_num"}
 
     stop = await nt_mcp_server.nt_stop_subscription(sub_id)
     assert stop["connected"] is True
@@ -562,7 +618,7 @@ async def test_nt_nonblocking_recording_lifecycle(
 ) -> None:
     """A recording can span user turns and returns a receipt when stopped."""
     start = await nt_mcp_server.nt_start_recording(
-        ["/SmartDashboard/"], output_dir=str(tmp_path)
+        topics=["/SmartDashboard/test_num"], output_dir=str(tmp_path)
     )
     assert start["connected"] is True
     assert start["started"] is True
@@ -576,8 +632,9 @@ async def test_nt_nonblocking_recording_lifecycle(
     assert stop["stopped"] is True
     assert stop["recording_id"] == recording_id
     assert stop["output"] == "file"
-    assert stop["rows"] >= len(FIXTURE_NAMES)
-    assert stop["topic_count"] >= len(FIXTURE_NAMES)
+    assert stop["rows"] >= 1
+    assert stop["topic_count"] == 1
+    assert stop["topics"] == ["/SmartDashboard/test_num"]
     assert stop["duration_seconds"] >= 0.0
     assert stop["duration_seconds"] == stop["capture_duration_seconds"]
     assert stop["capture_started_at"] <= stop["capture_ended_at"]
@@ -763,6 +820,38 @@ async def test_nt_subscribe_offline_summary(
     assert summary["count"] >= 1
     assert summary["last_value"] == 42.0
     assert "min" in summary
+
+
+@pytest.mark.anyio
+async def test_nt_subscribe_offline_rich_topic_selectors(
+    mcp_synced: None, tmp_path
+) -> None:
+    """Offline reads accept exact topics, regex, and wildcard filters."""
+    recorder = nt_recorder.Recorder(
+        nt_mcp_server.manager,
+        output_dir=str(tmp_path),
+        prefixes=["/SmartDashboard/"],
+        duration=1.0,
+    )
+    await recorder.run()
+
+    exact = nt_mcp_server.nt_subscribe_offline(
+        topics=["/SmartDashboard/test_num"], output_dir=str(tmp_path)
+    )
+    assert set(exact["topics"]) == {"/SmartDashboard/test_num"}
+
+    regex = nt_mcp_server.nt_subscribe_offline(
+        regex=r"test_(num|str)$", output_dir=str(tmp_path)
+    )
+    assert set(regex["topics"]) == {
+        "/SmartDashboard/test_num",
+        "/SmartDashboard/test_str",
+    }
+
+    wildcard = nt_mcp_server.nt_subscribe_offline(
+        wildcard="/SmartDashboard/test_arr", output_dir=str(tmp_path)
+    )
+    assert set(wildcard["topics"]) == {"/SmartDashboard/test_arr"}
 
 
 def test_nt_get_history_missing_recording_returns_empty() -> None:

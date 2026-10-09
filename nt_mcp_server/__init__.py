@@ -17,7 +17,7 @@ from typing import Any
 from fastmcp import FastMCP
 
 from .nt_manager import NTConnectError, NTManager
-from .nt_types import enforce_max_chars, summarize
+from .nt_types import TopicSelector, enforce_max_chars, summarize
 from . import nt_recorder
 
 mcp = FastMCP("NetworkTables")
@@ -44,12 +44,21 @@ _recording_tasks: dict[str, asyncio.Task[str]] = {}
 _recorders: dict[str, nt_recorder.Recorder] = {}
 
 
-async def _consume_subscription(subscription_id: str, prefixes: list[str], buffer_size: int) -> None:
+async def _consume_subscription(
+    subscription_id: str,
+    prefixes: list[str] | None,
+    topics: list[str] | None,
+    regex: str | None,
+    wildcard: str | None,
+    buffer_size: int,
+) -> None:
     """Consume the stream for ``subscription_id`` into its buffer."""
     buffer: list[dict[str, Any]] = []
     _subscription_buffers[subscription_id] = buffer
     try:
-        async for topic, value, time_seconds in manager.subscribe_stream(prefixes):
+        async for topic, value, time_seconds in manager.subscribe_stream(
+            prefixes, topics, regex, wildcard
+        ):
             buffer.append({"topic": topic, "time": time_seconds, "value": value})
             if len(buffer) > buffer_size:
                 buffer.pop(0)
@@ -112,6 +121,25 @@ def _iso_timestamp(unix_time: float | None) -> str | None:
     return datetime.datetime.fromtimestamp(
         unix_time, tz=datetime.timezone.utc
     ).isoformat()
+
+
+def _topic_selector(
+    prefixes: list[str] | None,
+    topics: list[str] | None,
+    regex: str | None,
+    wildcard: str | None,
+) -> tuple[TopicSelector | None, str | None]:
+    """Validate a tool's topic selectors and return a structured error."""
+    try:
+        selector = TopicSelector(prefixes, topics, regex, wildcard)
+    except ValueError as exc:
+        return None, str(exc)
+    if selector.empty:
+        return None, (
+            "at least one topic selector is required: prefixes, topics, "
+            "regex, or wildcard"
+        )
+    return selector, None
 
 
 def _clip_topic_rows(
@@ -287,7 +315,7 @@ async def nt_list_topics(
 
 @mcp.tool()
 async def nt_subscribe(
-    prefixes: list[str],
+    prefixes: list[str] | None = None,
     duration: float = 10.0,
     sample_interval: float | None = None,
     change_only: float | None = None,
@@ -295,8 +323,15 @@ async def nt_subscribe(
     limit: int | None = None,
     max_rows: int = 5000,
     output_dir: str | None = None,
+    topics: list[str] | None = None,
+    regex: str | None = None,
+    wildcard: str | None = None,
 ) -> dict:
-    """Sample value updates under ``prefixes`` for ``duration`` seconds.
+    """Sample selected value updates for ``duration`` seconds.
+
+    ``prefixes`` and exact ``topics`` are ORed within their lists; selector
+    kinds are ANDed together. ``regex`` searches the full topic name and
+    ``wildcard`` uses shell-style globbing. At least one selector is required.
 
     ``output`` supersedes the removed ``format`` parameter and defaults
     to ``"file"``: the same window is captured to an NDJSON recording
@@ -318,6 +353,16 @@ async def nt_subscribe(
     """
     if not manager.is_connected():
         return {"connected": False, "error": "NT server disconnected"}
+    selector, selector_error = _topic_selector(
+        prefixes, topics, regex, wildcard
+    )
+    if selector_error is not None:
+        return {
+            "connected": True,
+            "output": output,
+            "error": selector_error,
+        }
+    assert selector is not None
     if output not in ("file", "summary", "samples"):
         return {
             "connected": True,
@@ -328,7 +373,7 @@ async def nt_subscribe(
                 "'summary', 'samples'"
             ),
         }
-    if output != "file" and any(p == "/" for p in prefixes):
+    if output != "file" and selector.bare_root_only:
         return {
             "connected": True,
             "output": output,
@@ -348,6 +393,9 @@ async def nt_subscribe(
             sample_interval=sample_interval,
             change_only=change_only,
             max_capture_rows=max_rows,
+            topics=topics,
+            regex=regex,
+            wildcard=wildcard,
         )
         path = await recorder.run()
         return {
@@ -363,6 +411,9 @@ async def nt_subscribe(
         change_only=change_only,
         format="samples",
         limit=limit,
+        topics=topics,
+        regex=regex,
+        wildcard=wildcard,
     )
     rows = sum(len(topic_samples) for topic_samples in samples.values())
     truncated = False
@@ -392,9 +443,12 @@ async def nt_subscribe(
 
 @mcp.tool()
 async def nt_start_subscription(
-    prefixes: list[str],
+    prefixes: list[str] | None = None,
     subscription_id: str | None = None,
     buffer_size: int = 1000,
+    topics: list[str] | None = None,
+    regex: str | None = None,
+    wildcard: str | None = None,
 ) -> dict:
     """Open a persistent subscription and start collecting samples.
 
@@ -405,6 +459,13 @@ async def nt_start_subscription(
     """
     if not manager.is_connected():
         return {"connected": False, "error": "NT server disconnected"}
+    _, selector_error = _topic_selector(prefixes, topics, regex, wildcard)
+    if selector_error is not None:
+        return {
+            "connected": True,
+            "started": False,
+            "error": selector_error,
+        }
     if subscription_id is None:
         subscription_id = str(uuid.uuid4())
     if subscription_id in _subscription_tasks:
@@ -415,7 +476,14 @@ async def nt_start_subscription(
             "error": "subscription already exists",
         }
     task = asyncio.create_task(
-        _consume_subscription(subscription_id, prefixes, buffer_size)
+        _consume_subscription(
+            subscription_id,
+            prefixes,
+            topics,
+            regex,
+            wildcard,
+            buffer_size,
+        )
     )
     _subscription_tasks[subscription_id] = task
     return {
@@ -464,11 +532,14 @@ async def nt_stop_subscription(subscription_id: str) -> dict:
 
 @mcp.tool()
 async def nt_start_recording(
-    prefixes: list[str],
+    prefixes: list[str] | None = None,
     sample_interval: float | None = None,
     change_only: float | None = None,
     max_rows: int = 5000,
     output_dir: str | None = None,
+    topics: list[str] | None = None,
+    regex: str | None = None,
+    wildcard: str | None = None,
 ) -> dict:
     """Start an NDJSON recording and return its id immediately.
 
@@ -478,6 +549,13 @@ async def nt_start_recording(
     """
     if not manager.is_connected():
         return {"connected": False, "error": "NT server disconnected"}
+    _, selector_error = _topic_selector(prefixes, topics, regex, wildcard)
+    if selector_error is not None:
+        return {
+            "connected": True,
+            "started": False,
+            "error": selector_error,
+        }
     dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
     recording_id = _new_recording_id()
     recorder = nt_recorder.Recorder(
@@ -489,6 +567,9 @@ async def nt_start_recording(
         change_only=change_only,
         max_capture_rows=max_rows,
         recording_id=recording_id,
+        topics=topics,
+        regex=regex,
+        wildcard=wildcard,
     )
     task = asyncio.create_task(recorder.run())
     _recorders[recording_id] = recorder
@@ -641,7 +722,7 @@ def nt_list_topics_offline(
 
 @mcp.tool()
 def nt_subscribe_offline(
-    prefixes: list[str],
+    prefixes: list[str] | None = None,
     recording_id: str | None = None,
     start: float | None = None,
     end: float | None = None,
@@ -651,8 +732,14 @@ def nt_subscribe_offline(
     sample_interval: float | None = None,
     format: str = "samples",
     output_dir: str | None = None,
+    topics: list[str] | None = None,
+    regex: str | None = None,
+    wildcard: str | None = None,
 ) -> dict:
-    """Return events for every topic under ``prefixes`` from a recording.
+    """Return selected events from a recording.
+
+    ``prefixes`` and exact ``topics`` are ORed within their lists; selector
+    kinds are ANDed. ``regex`` and ``wildcard`` match full topic names.
 
     ``last_seconds`` selects the most recent N seconds. ``sample_interval``
     decimates per-topic samples, and ``format="summary"`` returns
@@ -664,7 +751,19 @@ def nt_subscribe_offline(
     character ceiling keeps the whole response under 60,000 serialized
     characters; any rows it drops set ``truncated: True``.
     """
-    if any(p == "/" for p in prefixes):
+    selector, selector_error = _topic_selector(
+        prefixes, topics, regex, wildcard
+    )
+    if selector_error is not None:
+        return {
+            "recording_id": recording_id,
+            "error": selector_error,
+            "rows": 0,
+            "total_rows": 0,
+            "truncated": False,
+        }
+    assert selector is not None
+    if selector.bare_root_only:
         return {
             "recording_id": recording_id,
             "error": (
@@ -678,18 +777,23 @@ def nt_subscribe_offline(
         }
     dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
     result = nt_recorder.subscribe_offline(
-        prefixes,
-        recording_id,
-        dir_,
-        start,
-        end,
-        last_seconds,
-        limit,
-        sample_interval,
-        format,
+        prefixes=prefixes,
+        recording_id=recording_id,
+        output_dir=dir_,
+        start=start,
+        end=end,
+        last_seconds=last_seconds,
+        limit=limit,
+        sample_interval=sample_interval,
+        format=format,
         return_meta=True,
+        topics=topics,
+        regex=regex,
+        wildcard=wildcard,
     )
-    topics = result["topics"] if format != "summary" else result["summary"]
+    topic_payload = (
+        result["topics"] if format != "summary" else result["summary"]
+    )
     rows = result["rows"]
     total_rows = result["total_rows"]
     truncated = result["truncated"]
@@ -697,7 +801,7 @@ def nt_subscribe_offline(
         # Enforce the total budget truthfully: clip per-topic lists until
         # the sum fits, then recompute rows/truncated from what remains.
         # Summary payloads are one small dict per topic - no row clip.
-        topics, rows = _clip_topic_rows(topics, max_rows)
+        topic_payload, rows = _clip_topic_rows(topic_payload, max_rows)
         truncated = True
     # Outermost guard: the row budgets above bound the row COUNT, but a
     # single row's value can be large enough that 5000 rows still serialize
@@ -706,7 +810,7 @@ def nt_subscribe_offline(
     return enforce_max_chars(
         {
             "recording_id": recording_id,
-            "topics": topics,
+            "topics": topic_payload,
             "rows": rows,
             "total_rows": total_rows,
             "truncated": truncated,

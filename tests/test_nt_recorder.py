@@ -260,6 +260,41 @@ async def test_reader_subscribe_offline_summary(
 
 
 @pytest.mark.anyio
+async def test_reader_subscribe_offline_rich_topic_selectors(
+    manager: NTManager, tmp_path
+) -> None:
+    """Offline reader combines exact, regex, and wildcard selectors."""
+    recorder = nt_recorder.Recorder(
+        manager, output_dir=str(tmp_path), prefixes=["/SmartDashboard/"], duration=1.0
+    )
+    await recorder.run()
+
+    exact = nt_recorder.subscribe_offline(
+        topics=["/SmartDashboard/test_num"], output_dir=str(tmp_path)
+    )
+    assert set(exact) == {"/SmartDashboard/test_num"}
+
+    combined = nt_recorder.subscribe_offline(
+        prefixes=["/SmartDashboard/"],
+        regex=r"test_(num|str)$",
+        wildcard="*/test_*",
+        output_dir=str(tmp_path),
+    )
+    assert set(combined) == {
+        "/SmartDashboard/test_num",
+        "/SmartDashboard/test_str",
+    }
+
+
+def test_reader_subscribe_offline_requires_valid_selector(tmp_path) -> None:
+    """Offline reader rejects missing and malformed selector definitions."""
+    with pytest.raises(ValueError, match="at least one topic selector"):
+        nt_recorder.subscribe_offline(output_dir=str(tmp_path))
+    with pytest.raises(ValueError, match="invalid topic regex"):
+        nt_recorder.subscribe_offline(regex="[", output_dir=str(tmp_path))
+
+
+@pytest.mark.anyio
 async def test_reader_get_recording_info(
     manager: NTManager, tmp_path
 ) -> None:

@@ -7,7 +7,9 @@ by the NT layer; no ntcore connection state lives here.
 
 from __future__ import annotations
 
+import fnmatch
 import json
+import re
 from typing import Any, Literal
 
 try:  # numpy is optional — normalize numpy values only when it is present
@@ -16,6 +18,76 @@ except ImportError:  # pragma: no cover - venv without numpy
     np = None  # type: ignore[assignment]
 
 ArrayKind = Literal["boolean", "integer", "double", "string"]
+
+
+class TopicSelector:
+    """Reusable topic matcher for live streams and offline recordings.
+
+    Multiple values inside ``prefixes`` or ``topics`` are ORed. Different
+    selector kinds are ANDed, matching ``nt_list_topics`` filter semantics.
+    Exact topics double as efficient NT subscription roots when no prefixes
+    are supplied; regex/wildcard-only selection subscribes at ``"/"`` and
+    filters events locally.
+    """
+
+    def __init__(
+        self,
+        prefixes: list[str] | None = None,
+        topics: list[str] | None = None,
+        regex: str | None = None,
+        wildcard: str | None = None,
+    ) -> None:
+        self.prefixes = tuple(prefixes or ())
+        self.topics = frozenset(topics or ())
+        self.regex = regex
+        self.wildcard = wildcard
+        try:
+            self._pattern = re.compile(regex) if regex is not None else None
+        except re.error as exc:
+            raise ValueError(f"invalid topic regex {regex!r}: {exc}") from exc
+
+    @property
+    def empty(self) -> bool:
+        """Whether no selector kind was supplied."""
+        return not (
+            self.prefixes
+            or self.topics
+            or self.regex is not None
+            or self.wildcard is not None
+        )
+
+    @property
+    def bare_root_only(self) -> bool:
+        """Whether the selector is exactly an unqualified ``'/'`` prefix."""
+        return (
+            self.prefixes == ("/",)
+            and not self.topics
+            and self.regex is None
+            and self.wildcard is None
+        )
+
+    @property
+    def subscription_prefixes(self) -> list[str]:
+        """Return the narrowest prefixes usable by NT MultiSubscriber."""
+        if self.prefixes:
+            return list(self.prefixes)
+        if self.topics:
+            return sorted(self.topics)
+        return ["/"]
+
+    def matches(self, topic: str) -> bool:
+        """Return whether ``topic`` satisfies every supplied selector kind."""
+        if self.prefixes and not any(
+            topic.startswith(prefix) for prefix in self.prefixes
+        ):
+            return False
+        if self.topics and topic not in self.topics:
+            return False
+        if self._pattern is not None and self._pattern.search(topic) is None:
+            return False
+        if self.wildcard is not None and not fnmatch.fnmatch(topic, self.wildcard):
+            return False
+        return True
 
 
 def array_kind(values: list[Any]) -> ArrayKind | None:

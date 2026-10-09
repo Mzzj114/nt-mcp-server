@@ -30,7 +30,7 @@ import time
 from typing import Any, Iterator
 
 from .nt_manager import NTConnectError, NTManager, StreamDecimator
-from .nt_types import summarize
+from .nt_types import TopicSelector, summarize
 
 _CONNECT_TIMEOUT_SECONDS = 5.0
 _CONNECT_POLL_SECONDS = 0.05
@@ -59,16 +59,25 @@ class Recorder:
         self,
         manager: NTManager,
         output_dir: str,
-        prefixes: list[str],
+        prefixes: list[str] | None,
         duration: float | None = None,
         sample_interval: float | None = None,
         change_only: float | None = None,
         max_capture_rows: int | None = None,
         recording_id: str | None = None,
+        topics: list[str] | None = None,
+        regex: str | None = None,
+        wildcard: str | None = None,
     ) -> None:
         self.manager = manager
         self.output_dir = output_dir
-        self.prefixes = prefixes
+        self.selector = TopicSelector(prefixes, topics, regex, wildcard)
+        if self.selector.empty:
+            raise ValueError("at least one topic selector is required")
+        self.prefixes = list(self.selector.prefixes)
+        self.selected_topics = sorted(self.selector.topics)
+        self.regex = regex
+        self.wildcard = wildcard
         self.duration = duration
         self.stop_event = asyncio.Event()
         self._decimator = StreamDecimator(
@@ -108,7 +117,12 @@ class Recorder:
                     try:
                         async with asyncio.timeout(self.duration):
                             async for topic, value, time_seconds in (
-                                self.manager.subscribe_stream(self.prefixes)
+                                self.manager.subscribe_stream(
+                                    self.prefixes,
+                                    self.selected_topics,
+                                    self.regex,
+                                    self.wildcard,
+                                )
                             ):
                                 if not self._write_filtered(
                                     file, topic, value, time_seconds
@@ -150,6 +164,9 @@ class Recorder:
             "event_ended_at": self.event_ended_at,
             "event_span_seconds": self.event_span_seconds,
             "prefixes": self.prefixes,
+            "topics": self.selected_topics,
+            "regex": self.regex,
+            "wildcard": self.wildcard,
             "sample_interval": self.sample_interval,
             "change_only": self.change_only,
             "max_rows": self._max_capture_rows,
@@ -181,7 +198,12 @@ class Recorder:
 
     async def _consume(self, file) -> None:
         async for topic, value, time_seconds in (
-            self.manager.subscribe_stream(self.prefixes)
+            self.manager.subscribe_stream(
+                self.prefixes,
+                self.selected_topics,
+                self.regex,
+                self.wildcard,
+            )
         ):
             if not self._write_filtered(file, topic, value, time_seconds):
                 break
@@ -612,7 +634,7 @@ def get_recording_info(
 
 
 def subscribe_offline(
-    prefixes: list[str],
+    prefixes: list[str] | None = None,
     recording_id: str | None = None,
     output_dir: str = "./recordings",
     start: float | None = None,
@@ -622,10 +644,15 @@ def subscribe_offline(
     sample_interval: float | None = None,
     format: str = "samples",
     return_meta: bool = False,
+    topics: list[str] | None = None,
+    regex: str | None = None,
+    wildcard: str | None = None,
 ) -> dict[str, Any]:
-    """Return events for every topic under ``prefixes``.
+    """Return events matching topic selectors.
 
     Returns ``{topic: [{"time": float, "value": jsonable}, ...] | summary}``.
+    Prefix and exact-topic lists are ORed internally; different selector
+    kinds are ANDed. At least one selector kind is required.
     ``start`` is inclusive, ``end`` is exclusive. ``last_seconds`` selects
     the most recent N seconds. If ``limit`` is given, it is applied per-topic
     (each topic gets at most ``limit`` entries). ``sample_interval`` and
@@ -640,6 +667,9 @@ def subscribe_offline(
 
     Note: do not call on a recording currently being written.
     """
+    selector = TopicSelector(prefixes, topics, regex, wildcard)
+    if selector.empty:
+        raise ValueError("at least one topic selector is required")
     path = _resolve_recording(recording_id, output_dir)
     if path is None:
         return {} if not return_meta else _meta_result({}, "topics", 0, 0)
@@ -650,7 +680,7 @@ def subscribe_offline(
         topic = event.get("topic")
         if not isinstance(topic, str):
             continue
-        if not any(topic.startswith(p) for p in prefixes):
+        if not selector.matches(topic):
             continue
         if start is not None and t < start:
             continue
