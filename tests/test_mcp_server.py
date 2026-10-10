@@ -3,7 +3,7 @@
 Each run spins up a real pyntcore NT4 server in-process
 (``NetworkTableInstance.create()``) on port 5810 — the same loopback
 recipe as ``tests/test_nt_manager.py`` — and drives the MCP tools as
-plain functions from :mod:`nt_mcp_server` (``nt_mcp_server.nt_get(...)``
+plain functions from :mod:`nt_mcp_server` (``nt_mcp_server.nt_read_topics(...)``
 etc.), never through the stdio transport.
 
 The module-level ``nt_mcp_server.manager`` uses
@@ -12,7 +12,7 @@ instance than the fixture server, so this is genuine cross-instance NT4
 traffic. The module-scoped ``mcp_synced`` fixture connects with
 ``nt_connect`` and waits for the fixture topics to sync once per module;
 every test then reuses the same connected manager. Sync tools
-(``nt_set``, ``nt_write_topics``, ``nt_disconnect``,
+(``nt_write_topics``, ``nt_disconnect``,
 ``nt_connection_info``) are called directly; async tools are awaited
 under ``pytest.mark.anyio``.
 """
@@ -28,6 +28,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
 import ntcore
 import pytest
+from fastmcp import Client
 
 import nt_mcp_server
 from nt_mcp_server import nt_recorder
@@ -91,6 +92,41 @@ async def test_all_tools_publish_safety_annotations() -> None:
     assert by_name["nt_query_recording"].annotations.openWorldHint is False
 
 
+@pytest.mark.anyio
+async def test_mcp_schemas_describe_and_validate_parameters() -> None:
+    """Published schemas constrain real MCP calls, including before a connection exists."""
+    async with Client(nt_mcp_server.mcp) as client:
+        tools = {tool.name: tool for tool in await client.list_tools()}
+        for tool in tools.values():
+            for name, parameter in tool.inputSchema.get("properties", {}).items():
+                assert parameter.get("description"), (tool.name, name)
+        sample = tools["nt_sample"].inputSchema["properties"]
+        assert sample["output"]["enum"] == ["summary", "samples"]
+        assert sample["output"]["default"] == "summary"
+        assert "output_dir" not in sample
+        assert sample["duration"]["exclusiveMinimum"] == 0
+        assert sample["duration"]["maximum"] == 60
+        for name, arguments in [
+            ("nt_sample", {"topics": [FIXTURE_NAMES[0]], "output": "file"}),
+            ("nt_sample", {"topics": [FIXTURE_NAMES[0]], "duration": 0}),
+            ("nt_query_recording", {"topics": [FIXTURE_NAMES[0]], "max_rows": -1}),
+            ("nt_query_recording", {"topics": [FIXTURE_NAMES[0]], "output": "invalid"}),
+            ("nt_get_recording_info", {"topic_limit": 1001}),
+            ("nt_connect", {"server_port": 65536}),
+            ("nt_read_topics", {"topics": []}),
+            ("nt_write_topics", {"updates": {}}),
+            ("nt_read_topics", {"topics": ["relative/topic"]}),
+            ("nt_stop_recording", {"recording_id": "../outside.ndjson"}),
+        ]:
+            result = await client.call_tool_mcp(name, arguments)
+            assert result.isError, (name, arguments)
+        # Transport remains usable after validation errors and exposes a text fallback.
+        result = await client.call_tool_mcp("nt_connection_info", {})
+        assert result.isError is False
+        assert result.structuredContent is not None
+        assert any(item.type == "text" for item in result.content)
+
+
 async def wait_until(
     condition: Callable[[], Awaitable[bool]],
     timeout: float = 10.0,
@@ -133,7 +169,10 @@ async def mcp_synced(nt_server: ntcore.NetworkTableInstance) -> AsyncIterator[No
         result = await nt_mcp_server.nt_list_topics()
         names = result["topics"]
         return all(name in names for name in FIXTURE_NAMES) and (
-            (await nt_mcp_server.nt_read_topics(["/SmartDashboard/test_num"]))["values"]["/SmartDashboard/test_num"] is not None
+            (await nt_mcp_server.nt_read_topics(["/SmartDashboard/test_num"]))[
+                "values"
+            ]["/SmartDashboard/test_num"]
+            is not None
         )
 
     assert await wait_until(synced, timeout=15.0), "tools never synced fixture topics"
@@ -211,8 +250,8 @@ async def test_nt_connection_info_is_json_serializable(mcp_synced: None) -> None
 
 
 @pytest.mark.anyio
-async def test_nt_get_returns_bare_value(mcp_synced: None) -> None:
-    """Given a published double, nt_get returns a wrapped value with connected flag."""
+async def test_nt_read_topics_single_topic(mcp_synced: None) -> None:
+    """A one-topic read returns its value under the same map as batch reads."""
     response = await nt_mcp_server.nt_read_topics(["/SmartDashboard/test_num"])
     assert response["connected"] is True
     assert response["values"]["/SmartDashboard/test_num"] == 42.0
@@ -240,31 +279,49 @@ async def test_nt_get_topic_info_unknown_topic(mcp_synced: None) -> None:
 
 
 @pytest.mark.anyio
-async def test_nt_set_int_roundtrip_preserves_type(mcp_synced: None) -> None:
-    """Given nt_set(7), nt_get returns the same int."""
+async def test_nt_write_topics_int_roundtrip_preserves_type(mcp_synced: None) -> None:
+    """A single-entry write preserves the integer NT type."""
     response = nt_mcp_server.nt_write_topics({"/SmartDashboard/mcp_int": 7})
-    assert response == {"connected": True, "results": {"/SmartDashboard/mcp_int": True}, "warnings": {"/SmartDashboard/mcp_int": None}}
-    value = (await nt_mcp_server.nt_read_topics(["/SmartDashboard/mcp_int"]))["values"]["/SmartDashboard/mcp_int"]
+    assert response == {
+        "connected": True,
+        "results": {"/SmartDashboard/mcp_int": True},
+        "warnings": {"/SmartDashboard/mcp_int": None},
+    }
+    value = (await nt_mcp_server.nt_read_topics(["/SmartDashboard/mcp_int"]))["values"][
+        "/SmartDashboard/mcp_int"
+    ]
     assert value == 7
     assert type(value) is int
 
 
 @pytest.mark.anyio
-async def test_nt_set_float_roundtrip_preserves_type(mcp_synced: None) -> None:
-    """Given nt_set(2.5), nt_get returns the same float."""
+async def test_nt_write_topics_float_roundtrip_preserves_type(mcp_synced: None) -> None:
+    """A single-entry write preserves the double NT type."""
     response = nt_mcp_server.nt_write_topics({"/SmartDashboard/mcp_double": 2.5})
-    assert response == {"connected": True, "results": {"/SmartDashboard/mcp_double": True}, "warnings": {"/SmartDashboard/mcp_double": None}}
-    value = (await nt_mcp_server.nt_read_topics(["/SmartDashboard/mcp_double"]))["values"]["/SmartDashboard/mcp_double"]
+    assert response == {
+        "connected": True,
+        "results": {"/SmartDashboard/mcp_double": True},
+        "warnings": {"/SmartDashboard/mcp_double": None},
+    }
+    value = (await nt_mcp_server.nt_read_topics(["/SmartDashboard/mcp_double"]))[
+        "values"
+    ]["/SmartDashboard/mcp_double"]
     assert value == 2.5
     assert type(value) is float
 
 
 @pytest.mark.anyio
-async def test_nt_set_bool_roundtrip_preserves_type(mcp_synced: None) -> None:
-    """Given nt_set(False), nt_get returns the same bool."""
+async def test_nt_write_topics_bool_roundtrip_preserves_type(mcp_synced: None) -> None:
+    """A single-entry write preserves the boolean NT type."""
     response = nt_mcp_server.nt_write_topics({"/SmartDashboard/mcp_bool": False})
-    assert response == {"connected": True, "results": {"/SmartDashboard/mcp_bool": True}, "warnings": {"/SmartDashboard/mcp_bool": None}}
-    value = (await nt_mcp_server.nt_read_topics(["/SmartDashboard/mcp_bool"]))["values"]["/SmartDashboard/mcp_bool"]
+    assert response == {
+        "connected": True,
+        "results": {"/SmartDashboard/mcp_bool": True},
+        "warnings": {"/SmartDashboard/mcp_bool": None},
+    }
+    value = (await nt_mcp_server.nt_read_topics(["/SmartDashboard/mcp_bool"]))[
+        "values"
+    ]["/SmartDashboard/mcp_bool"]
     assert value is False
     assert type(value) is bool
 
@@ -321,10 +378,8 @@ async def test_nt_list_topics_regex_filter(mcp_synced: None) -> None:
 
 
 @pytest.mark.anyio
-async def test_nt_subscribe_default_writes_file_receipt(
-    mcp_synced: None, tmp_path
-) -> None:
-    """Default output='file' writes an NDJSON recording and a receipt.
+async def test_nt_recording_writes_file_receipt(mcp_synced: None, tmp_path) -> None:
+    """The recording lifecycle writes an NDJSON recording and a receipt.
 
     The receipt carries recording metadata only — no sample values —
     and the whole response stays well under the budget ceiling.
@@ -399,9 +454,7 @@ async def test_nt_sample_samples_mode_enforces_budget(mcp_synced: None) -> None:
 async def test_nt_sample_inline_rejects_bare_root_prefix(mcp_synced: None) -> None:
     """A bare '/' prefix is refused on inline modes with an actionable error."""
     for output in ("samples", "summary"):
-        response = await nt_mcp_server.nt_sample(
-            ["/"], output=output, duration=0.5
-        )
+        response = await nt_mcp_server.nt_sample(["/"], output=output, duration=0.5)
         assert response["connected"] is True
         assert "error" in response
         assert "prefix '/'" in response["error"]
@@ -409,10 +462,8 @@ async def test_nt_sample_inline_rejects_bare_root_prefix(mcp_synced: None) -> No
 
 
 @pytest.mark.anyio
-async def test_nt_subscribe_file_mode_allows_bare_root_prefix(
-    mcp_synced: None, tmp_path
-) -> None:
-    """output='file' accepts '/': spilling to disk is the sanctioned escape."""
+async def test_nt_recording_allows_bare_root_prefix(mcp_synced: None, tmp_path) -> None:
+    """File recording accepts the root prefix for broad capture."""
     start = await nt_mcp_server.nt_start_recording(["/"], output_dir=str(tmp_path))
     await asyncio.sleep(1.0)
     response = await nt_mcp_server.nt_stop_recording(start["recording_id"])
@@ -470,14 +521,10 @@ async def test_nt_sample_rich_topic_selectors(
 @pytest.mark.anyio
 async def test_nt_sample_selector_validation(mcp_synced: None) -> None:
     """Missing and malformed selectors return compact structured errors."""
-    missing = await nt_mcp_server.nt_sample(
-        duration=0.1, output="summary"
-    )
+    missing = await nt_mcp_server.nt_sample(duration=0.1, output="summary")
     assert "at least one topic selector" in missing["error"]
 
-    invalid = await nt_mcp_server.nt_sample(
-        regex="[", duration=0.1, output="summary"
-    )
+    invalid = await nt_mcp_server.nt_sample(regex="[", duration=0.1, output="summary")
     assert "invalid topic regex" in invalid["error"]
 
     narrowed_root = await nt_mcp_server.nt_sample(
@@ -498,7 +545,9 @@ async def test_nt_set_type_warning(mcp_synced: None) -> None:
     """
     # Use a fresh topic so the mismatch does not corrupt fixture topics.
     nt_mcp_server.nt_write_topics({"/SmartDashboard/mcp_warn_num": 1.0})
-    response = nt_mcp_server.nt_write_topics({"/SmartDashboard/mcp_warn_num": "not a number"})
+    response = nt_mcp_server.nt_write_topics(
+        {"/SmartDashboard/mcp_warn_num": "not a number"}
+    )
     assert response["connected"] is True
     assert response["warnings"]["/SmartDashboard/mcp_warn_num"] is not None
     assert "expected double" in response["warnings"]["/SmartDashboard/mcp_warn_num"]
@@ -508,7 +557,9 @@ async def test_nt_set_type_warning(mcp_synced: None) -> None:
 async def test_nt_set_strict_type_check(mcp_synced: None) -> None:
     """strict_type_check=True refuses mismatched writes."""
     nt_mcp_server.nt_write_topics({"/SmartDashboard/mcp_strict_num": 1.0})
-    response = nt_mcp_server.nt_write_topics({"/SmartDashboard/mcp_strict_num": "not a number"}, strict_type_check=True)
+    response = nt_mcp_server.nt_write_topics(
+        {"/SmartDashboard/mcp_strict_num": "not a number"}, strict_type_check=True
+    )
     assert response["connected"] is True
     assert response["results"]["/SmartDashboard/mcp_strict_num"] is False
     assert response["warnings"]["/SmartDashboard/mcp_strict_num"] is not None
@@ -517,14 +568,17 @@ async def test_nt_set_strict_type_check(mcp_synced: None) -> None:
 @pytest.mark.anyio
 async def test_nt_disconnect_returns_status_and_reconnects(mcp_synced: None) -> None:
     """Given a live client, nt_disconnect stops it; nt_connect restores it."""
-    assert nt_mcp_server.nt_disconnect() == {"connected": False, "status": "disconnected"}
+    assert nt_mcp_server.nt_disconnect() == {
+        "connected": False,
+        "status": "disconnected",
+    }
 
     async def disconnected() -> bool:
         return nt_mcp_server.nt_connection_info()["connected"] is False
 
-    assert await wait_until(
-        disconnected, timeout=2.0
-    ), "client still connected after nt_disconnect"
+    assert await wait_until(disconnected, timeout=2.0), (
+        "client still connected after nt_disconnect"
+    )
 
     # After disconnect, read tools report the disconnected state clearly.
     response = await nt_mcp_server.nt_get_topic_info("/SmartDashboard/test_num")
@@ -579,12 +633,17 @@ async def test_nt_disconnect_then_reconnect_to_different_target(
         }
 
         async def synced() -> bool:
-            response = await nt_mcp_server.nt_read_topics(["/SmartDashboard/second_num"])
-            return response["connected"] is True and response["values"]["/SmartDashboard/second_num"] is not None
+            response = await nt_mcp_server.nt_read_topics(
+                ["/SmartDashboard/second_num"]
+            )
+            return (
+                response["connected"] is True
+                and response["values"]["/SmartDashboard/second_num"] is not None
+            )
 
-        assert await wait_until(
-            synced, timeout=10.0
-        ), "reconnected client never synced the second server's topic"
+        assert await wait_until(synced, timeout=10.0), (
+            "reconnected client never synced the second server's topic"
+        )
     finally:
         nt_mcp_server.nt_disconnect()
         second_server.stopServer()
@@ -659,9 +718,7 @@ async def test_nt_persistent_subscription(mcp_synced: None) -> None:
 
 
 @pytest.mark.anyio
-async def test_nt_nonblocking_recording_lifecycle(
-    mcp_synced: None, tmp_path
-) -> None:
+async def test_nt_nonblocking_recording_lifecycle(mcp_synced: None, tmp_path) -> None:
     """A recording can span user turns and returns a receipt when stopped."""
     start = await nt_mcp_server.nt_start_recording(
         topics=["/SmartDashboard/test_num"], output_dir=str(tmp_path)
@@ -697,9 +754,7 @@ async def test_nt_nonblocking_recording_lifecycle(
 
 
 @pytest.mark.anyio
-async def test_nt_list_recordings_returns_metadata(
-    mcp_synced: None, tmp_path
-) -> None:
+async def test_nt_list_recordings_returns_metadata(mcp_synced: None, tmp_path) -> None:
     """Given a recording, nt_list_recordings returns metadata entries."""
     recorder = nt_recorder.Recorder(
         nt_mcp_server.manager,
@@ -787,9 +842,7 @@ async def test_nt_get_recording_info(mcp_synced: None, tmp_path) -> None:
 
 
 @pytest.mark.anyio
-async def test_nt_get_recording_info_returns_topics(
-    mcp_synced: None, tmp_path
-) -> None:
+async def test_nt_get_recording_info_returns_topics(mcp_synced: None, tmp_path) -> None:
     """Given a recording, nt_get_recording_info returns topics; prefix narrows."""
     recorder = nt_recorder.Recorder(
         nt_mcp_server.manager,
@@ -809,9 +862,7 @@ async def test_nt_get_recording_info_returns_topics(
 
 
 @pytest.mark.anyio
-async def test_nt_query_recording_returns_dict(
-    mcp_synced: None, tmp_path
-) -> None:
+async def test_nt_query_recording_returns_dict(mcp_synced: None, tmp_path) -> None:
     """Given a recording, nt_query_recording buckets events by topic."""
     recorder = nt_recorder.Recorder(
         nt_mcp_server.manager,
@@ -846,9 +897,7 @@ async def test_nt_query_recording_returns_dict(
 
 
 @pytest.mark.anyio
-async def test_nt_query_recording_summary(
-    mcp_synced: None, tmp_path
-) -> None:
+async def test_nt_query_recording_summary(mcp_synced: None, tmp_path) -> None:
     """subscribe_offline with format=summary returns per-topic summaries."""
     recorder = nt_recorder.Recorder(
         nt_mcp_server.manager,
@@ -927,7 +976,7 @@ async def test_nt_query_recording_rejects_bare_root_prefix(
     result = nt_mcp_server.nt_query_recording(["/"], output_dir=str(tmp_path))
     assert "error" in result
     assert "/" in result["error"]
-    assert "nt-recorder" in result["error"]
+    assert "nt_get_recording_info" in result["error"]
     assert result["rows"] == 0
     assert result["truncated"] is False
     json.dumps(result)
@@ -985,15 +1034,73 @@ async def test_nt_query_recording_max_rows_enforces_budget(
     assert len(json.dumps(result)) < 60_000
 
 
+@pytest.mark.parametrize("output", ["samples", "summary"])
+def test_recording_query_budgets_apply_to_both_outputs(tmp_path, output) -> None:
+    recording = tmp_path / "budgets.ndjson"
+    events = [{"time": float(i + 1), "topic": "/test/a", "value": i} for i in range(4)]
+    recording.write_text(
+        "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+    )
+    result = nt_mcp_server.nt_query_recording(
+        topics=["/test/a"], output_dir=str(tmp_path), output=output, max_rows=2
+    )
+    assert result["rows"] == 2
+    assert result["total_rows"] == 4
+    assert result["truncated"] is True
+    if output == "summary":
+        assert result["topics"]["/test/a"]["count"] == 2
+        assert result["topics"]["/test/a"]["mean"] == 0.5
+    else:
+        assert len(result["topics"]["/test/a"]) == 2
+    # Large string last_values are subject to the character ceiling as well.
+    events[0]["value"] = "x" * 70_000
+    recording.write_text(
+        "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+    )
+    result = nt_mcp_server.nt_query_recording(
+        topics=["/test/a"], output_dir=str(tmp_path), output=output
+    )
+    assert len(json.dumps(result)) <= 60_000
+    assert result["rows"] == 3
+    assert result["truncated"] is True
+
+
+@pytest.mark.anyio
+async def test_live_per_topic_limit_reports_clipping(mcp_synced: None) -> None:
+    topic = "/SmartDashboard/per_topic_budget"
+
+    async def churn() -> None:
+        for i in range(20):
+            nt_mcp_server.nt_write_topics({topic: float(i)})
+            await asyncio.sleep(0.025)
+
+    churn_task = asyncio.create_task(churn())
+    try:
+        result = await nt_mcp_server.nt_sample(topics=[topic], duration=0.6, limit=2)
+    finally:
+        await churn_task
+    assert result["rows"] == 2
+    assert result["total_rows"] > 2
+    assert result["truncated"] is True
+    assert result["samples"][topic]["count"] == 2
+
+
 def test_recording_info_filters_and_bounds_topics(tmp_path) -> None:
     """Topic filters affect discovery counts, while metadata describes the whole file."""
     recording = tmp_path / "filters.ndjson"
-    events = [{"time": float(i + 1), "topic": name, "value": i}
-              for i, name in enumerate(["/drive/a", "/drive/b", "/arm/a"])]
-    recording.write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
+    events = [
+        {"time": float(i + 1), "topic": name, "value": i}
+        for i, name in enumerate(["/drive/a", "/drive/b", "/arm/a"])
+    ]
+    recording.write_text(
+        "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+    )
     info = nt_mcp_server.nt_get_recording_info(
-        output_dir=str(tmp_path), prefix="/drive/", regex=r"[ab]$",
-        wildcard="*/?", topic_limit=1,
+        output_dir=str(tmp_path),
+        prefix="/drive/",
+        regex=r"[ab]$",
+        wildcard="*/?",
+        topic_limit=1,
     )
     assert info["total_samples"] == 3
     assert info["topic_count"] == 3
@@ -1001,7 +1108,9 @@ def test_recording_info_filters_and_bounds_topics(tmp_path) -> None:
     assert info["topics"] == ["/drive/a"]
     assert info["topics_returned"] == 1
     assert info["topics_truncated"] is True
-    empty = nt_mcp_server.nt_get_recording_info(output_dir=str(tmp_path), prefix="/none/")
+    empty = nt_mcp_server.nt_get_recording_info(
+        output_dir=str(tmp_path), prefix="/none/"
+    )
     assert empty["topics"] == []
     assert empty["topics_truncated"] is False
     invalid = nt_mcp_server.nt_get_recording_info(output_dir=str(tmp_path), regex="[")
@@ -1009,16 +1118,24 @@ def test_recording_info_filters_and_bounds_topics(tmp_path) -> None:
 
 
 @pytest.mark.anyio
-async def test_offline_tools_reject_active_recording(mcp_synced: None, tmp_path) -> None:
-    start = await nt_mcp_server.nt_start_recording(topics=[FIXTURE_NAMES[0]], output_dir=str(tmp_path))
+async def test_offline_tools_reject_active_recording(
+    mcp_synced: None, tmp_path
+) -> None:
+    start = await nt_mcp_server.nt_start_recording(
+        topics=[FIXTURE_NAMES[0]], output_dir=str(tmp_path)
+    )
     try:
         info = nt_mcp_server.nt_get_recording_info(output_dir=str(tmp_path))
-        query = nt_mcp_server.nt_query_recording(topics=[FIXTURE_NAMES[0]], output_dir=str(tmp_path))
+        query = nt_mcp_server.nt_query_recording(
+            topics=[FIXTURE_NAMES[0]], output_dir=str(tmp_path)
+        )
         assert "recording is active" in info["error"]
         assert "recording is active" in query["error"]
     finally:
         await nt_mcp_server.nt_stop_recording(start["recording_id"])
-    query = nt_mcp_server.nt_query_recording(topics=[FIXTURE_NAMES[0]], output_dir=str(tmp_path))
+    query = nt_mcp_server.nt_query_recording(
+        topics=[FIXTURE_NAMES[0]], output_dir=str(tmp_path)
+    )
     assert query["recording_id"] == start["recording_id"]
     assert "error" not in query
 
@@ -1109,7 +1226,9 @@ def test_enforce_max_chars_leaves_summary_containers_alone() -> None:
 
 def test_enforce_max_chars_forces_truncated_without_rows_key() -> None:
     """Envelopes without a rows field still get a truthful truncated flag."""
-    response = {"samples": [{"time": 2.0, "value": "h" * 500}, {"time": 1.0, "value": 1}]}
+    response = {
+        "samples": [{"time": 2.0, "value": "h" * 500}, {"time": 1.0, "value": 1}]
+    }
     result = enforce_max_chars(response, "samples", 200)
     assert "rows" not in result
     assert result["truncated"] is True
@@ -1129,9 +1248,7 @@ def test_nt_query_recording_char_ceiling_worst_case(tmp_path) -> None:
             topic = f"/SmartDashboard/dense_{topic_i}"
             for i in range(700):
                 file.write(
-                    json.dumps(
-                        {"time": 1000.0 + i, "topic": topic, "value": 1234.5678}
-                    )
+                    json.dumps({"time": 1000.0 + i, "topic": topic, "value": 1234.5678})
                     + "\n"
                 )
     result = nt_mcp_server.nt_query_recording(
@@ -1203,12 +1320,10 @@ RECEIPT_KEYS = {
 
 
 @pytest.mark.anyio
-async def test_budget_default_subscribe_receipt_is_bounded(
-    mcp_synced: None, tmp_path
-) -> None:
-    """(a) A broad default nt_subscribe returns a small value-free receipt.
+async def test_budget_recording_receipt_is_bounded(mcp_synced: None, tmp_path) -> None:
+    """(a) Stopping a broad recording returns a small value-free receipt.
 
-    Given the synced fixture, When nt_subscribe runs with default
+    Given the synced fixture, When the recording lifecycle runs with default
     arguments on the whole /SmartDashboard/ prefix, Then the response is
     exactly the receipt contract (no "samples" key, so no sample values
     can leak) and serializes far under the 20,000-char receipt budget.
@@ -1268,9 +1383,7 @@ async def test_budget_bare_root_summary_returns_structured_error(
     inline mode, Then the response is a structured error naming the
     prefix and the sanctioned nt_start_recording escape — never samples.
     """
-    response = await nt_mcp_server.nt_sample(
-        ["/"], output="summary", duration=0.5
-    )
+    response = await nt_mcp_server.nt_sample(["/"], output="summary", duration=0.5)
     assert response["connected"] is True
     assert "error" in response
     assert "prefix '/'" in response["error"]
@@ -1350,9 +1463,7 @@ async def test_budget_query_single_topic_limit_reports_true_total(
 
     # The true count for THIS topic, straight from the NDJSON file.
     with open(recording_path, encoding="utf-8") as file:
-        topic_events = sum(
-            1 for line in file if json.loads(line)["topic"] == topic
-        )
+        topic_events = sum(1 for line in file if json.loads(line)["topic"] == topic)
     assert topic_events >= recorded
 
     result = nt_mcp_server.nt_query_recording(

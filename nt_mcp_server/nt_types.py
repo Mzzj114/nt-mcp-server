@@ -225,8 +225,8 @@ def enforce_max_chars(
     """Trim a tool response's row container until it serializes <= ``max_chars``.
 
     ``response`` is a JSON-able envelope whose ``container_key`` field holds
-    either a flat list of rows (``nt_get_history`` samples) or a dict of
-    topic -> list of rows (``nt_subscribe_offline`` topics; ``nt_subscribe``
+    either a flat list of rows or a dict of
+    topic -> list of rows (``nt_query_recording`` topics; ``nt_sample``
     sample modes). Rows that do not fit the ceiling are dropped; non-list
     values (summaries) are never touched, and a container with none is
     returned unchanged.

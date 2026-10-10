@@ -13,9 +13,10 @@ import json
 import os
 import time
 import uuid
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
+from pydantic import Field
 
 from .nt_manager import NTConnectError, NTManager
 from .nt_types import TopicSelector, enforce_max_chars, summarize
@@ -33,6 +34,173 @@ _MAX_RESPONSE_CHARS = 60_000
 
 # The file-mode receipt lists at most this many topic names.
 _MAX_RECEIPT_TOPICS = 50
+
+# Shared parameter contracts are included in the MCP input schemas.
+TopicName = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=2048,
+        pattern=r"^/",
+        description="Absolute NT topic name, such as /SmartDashboard/Speed.",
+    ),
+]
+TopicNames = Annotated[
+    list[TopicName],
+    Field(
+        min_length=1,
+        max_length=100,
+        description="Exact topic names to read; a one-element list reads one topic.",
+    ),
+]
+SelectedTopics = Annotated[
+    list[TopicName] | None,
+    Field(
+        min_length=1,
+        max_length=100,
+        description="Exact topic names, ORed within the list and ANDed with other selectors; omitted means no exact-name filter.",
+    ),
+]
+SelectedPrefixes = Annotated[
+    list[TopicName] | None,
+    Field(
+        min_length=1,
+        max_length=100,
+        description="Topic prefixes, ORed within the list and ANDed with other selectors; omitted means no prefix filter.",
+    ),
+]
+PrefixFilter = Annotated[
+    str | None,
+    Field(
+        max_length=2048, description="Topic name prefix; omitted includes all prefixes."
+    ),
+]
+RegexFilter = Annotated[
+    str | None,
+    Field(
+        max_length=2048,
+        description="Python regex searched anywhere in the topic name; omitted disables this filter.",
+    ),
+]
+WildcardFilter = Annotated[
+    str | None,
+    Field(
+        max_length=2048,
+        description="Shell-style topic glob, for example /SmartDashboard/*/Speed; omitted disables this filter.",
+    ),
+]
+RecordingDirectory = Annotated[
+    str | None,
+    Field(
+        min_length=1,
+        description="Server-side recording directory; defaults to NT_RECORDINGS_DIR or ./recordings.",
+    ),
+]
+RecordingId = Annotated[
+    str,
+    Field(
+        pattern=r"^[^/\\]+\.ndjson$",
+        description="Recording filename returned by nt_start_recording or nt_list_recordings, without directory components.",
+    ),
+]
+SelectedRecording = Annotated[
+    RecordingId | None,
+    Field(
+        description="Recording filename; omitted selects the most recently modified recording in the directory."
+    ),
+]
+SubscriptionId = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=128,
+        description="Handle returned by nt_start_subscription.",
+    ),
+]
+NewSubscriptionId = Annotated[
+    str | None,
+    Field(
+        min_length=1,
+        max_length=128,
+        description="Optional subscription handle; omitted generates a UUID.",
+    ),
+]
+SampleInterval = Annotated[
+    float | None,
+    Field(
+        gt=0,
+        allow_inf_nan=False,
+        description="Minimum seconds between retained events per topic; omitted keeps every event.",
+    ),
+]
+ChangeThreshold = Annotated[
+    float | None,
+    Field(
+        ge=0,
+        allow_inf_nan=False,
+        description="Skip numeric changes at or below this threshold, or unchanged non-numeric values; omitted disables change filtering.",
+    ),
+]
+OutputMode = Annotated[
+    Literal["summary", "samples"],
+    Field(
+        description="summary returns statistics over retained rows; samples returns timestamp/value rows."
+    ),
+]
+RowLimit = Annotated[
+    int,
+    Field(
+        ge=1, le=5000, description="Maximum retained events per topic, from 1 to 5000."
+    ),
+]
+OptionalRowLimit = Annotated[
+    int | None,
+    Field(
+        ge=1,
+        le=5000,
+        description="Maximum retained events per topic; omitted uses only the total row budget.",
+    ),
+]
+RowBudget = Annotated[
+    int,
+    Field(
+        ge=1,
+        le=5000,
+        description="Maximum total retained events across topics, from 1 to 5000; clipped results report truncated.",
+    ),
+]
+CaptureBudget = Annotated[
+    int,
+    Field(
+        ge=1,
+        le=1_000_000,
+        description="Maximum events written to the recording; reaching the cap ends capture and the receipt reports truncated.",
+    ),
+]
+StartTime = Annotated[
+    float | None,
+    Field(
+        ge=0,
+        allow_inf_nan=False,
+        description="Inclusive event timestamp bound in seconds, using the recording's NT time clock; omitted is unbounded.",
+    ),
+]
+EndTime = Annotated[
+    float | None,
+    Field(
+        ge=0,
+        allow_inf_nan=False,
+        description="Exclusive event timestamp bound in seconds, using the recording's NT time clock; omitted is unbounded.",
+    ),
+]
+LastSeconds = Annotated[
+    float | None,
+    Field(
+        gt=0,
+        allow_inf_nan=False,
+        description="Most recent N seconds relative to the recording's latest NT event timestamp, not its wall-clock capture end; omitted selects the full time range.",
+    ),
+]
 
 # Persistent subscription state. Each subscription is a background asyncio
 # Task consuming ``manager.subscribe_stream`` and appending to a list buffer.
@@ -154,11 +322,19 @@ def _closed_recording_id(
         recording_id = recordings[0]["id"]
     path = os.path.normcase(os.path.abspath(os.path.join(output_dir, recording_id)))
     for active_id, recorder in _recorders.items():
-        active_path = os.path.normcase(os.path.abspath(os.path.join(recorder.output_dir, active_id)))
+        active_path = os.path.normcase(
+            os.path.abspath(os.path.join(recorder.output_dir, active_id))
+        )
         if path == active_path and not _recording_tasks[active_id].done():
-            return recording_id, "recording is active; nt_stop_recording closes it before offline queries"
+            return (
+                recording_id,
+                "recording is active; nt_stop_recording closes it before offline queries",
+            )
     if not os.path.isfile(path):
-        return recording_id, f"recording {recording_id!r} not found; nt_list_recordings lists available files"
+        return (
+            recording_id,
+            f"recording {recording_id!r} not found; nt_list_recordings lists available files",
+        )
     return recording_id, None
 
 
@@ -195,7 +371,9 @@ def _bounded_events(response: dict, key: str, output: str, max_rows: int) -> dic
     response["truncated"] = rows < response["total_rows"]
     response = enforce_max_chars(response, key, _MAX_RESPONSE_CHARS)
     if output == "summary":
-        response[key] = {topic: summarize(items) for topic, items in response[key].items()}
+        response[key] = {
+            topic: summarize(items) for topic, items in response[key].items()
+        }
         # A last_value can itself be large; summaries also need the ceiling.
         while response[key] and len(json.dumps(response)) > _MAX_RESPONSE_CHARS:
             topic = next(reversed(response[key]))
@@ -214,11 +392,41 @@ def _bounded_events(response: dict, key: str, output: str, max_rows: int) -> dic
     }
 )
 async def nt_connect(
-    server_ip: str = "127.0.0.1",
-    server_port: int = 5810,
-    team_number: int | None = None,
-    identity: str = "nt-mcp",
-    timeout_seconds: float = _CONNECT_TIMEOUT_SECONDS,
+    server_ip: Annotated[
+        str,
+        Field(
+            min_length=1,
+            description="NT4 server IP or hostname; defaults to the local sim. Use team_number for a team target.",
+        ),
+    ] = "127.0.0.1",
+    server_port: Annotated[
+        int, Field(ge=1, le=65535, description="NT4 TCP port; defaults to 5810.")
+    ] = 5810,
+    team_number: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            le=99999,
+            description="FRC team number for robot address lookup; omitted uses server_ip/server_port.",
+        ),
+    ] = None,
+    identity: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=128,
+            description="NT client name visible to the server.",
+        ),
+    ] = "nt-mcp",
+    timeout_seconds: Annotated[
+        float,
+        Field(
+            gt=0,
+            le=60,
+            allow_inf_nan=False,
+            description="Maximum seconds to wait for a live connection, up to 60.",
+        ),
+    ] = _CONNECT_TIMEOUT_SECONDS,
 ) -> dict:
     """Start the NT4 client and wait for a live connection.
 
@@ -285,7 +493,7 @@ def nt_disconnect() -> dict:
     }
 )
 def nt_connection_info() -> dict:
-    """Return ``{"connected": bool, "connections": [...]}``."""
+    """Return connection state, remote peers, resolved target and package version."""
     return manager.connection_info()
 
 
@@ -298,10 +506,12 @@ def nt_connection_info() -> dict:
         "openWorldHint": True,
     }
 )
-async def nt_read_topics(topics: list[str]) -> dict:
-    """Return values for every requested topic.
+async def nt_read_topics(topics: TopicNames) -> dict:
+    """Read current values for one or more exact topic names.
 
-    Response: ``{"connected": bool, "values": {topic: value}}``.
+    Returns ``{"connected": bool, "values": {topic: value | null}}``;
+    unknown topics have null values. ``nt_get_topic_info`` returns type and
+    properties, and ``nt_sample`` observes changes over a time window.
     """
     if not manager.is_connected():
         return {"connected": False, "error": "NT server disconnected"}
@@ -317,10 +527,11 @@ async def nt_read_topics(topics: list[str]) -> dict:
         "openWorldHint": True,
     }
 )
-async def nt_get_topic_info(topic: str) -> dict:
-    """Return metadata for ``topic``.
+async def nt_get_topic_info(topic: TopicName) -> dict:
+    """Return a topic's name, NT type and properties, or null if unknown.
 
-    Response: ``{"connected": bool, "info": {...} | null}``.
+    Returns ``{"connected": bool, "info": {...} | null}``.
+    ``nt_read_topics`` returns current values.
     """
     if not manager.is_connected():
         return {"connected": False, "error": "NT server disconnected"}
@@ -336,11 +547,28 @@ async def nt_get_topic_info(topic: str) -> dict:
         "openWorldHint": True,
     }
 )
-def nt_write_topics(updates: dict[str, Any], strict_type_check: bool = False) -> dict:
-    """Write every ``{topic: value}`` pair.
+def nt_write_topics(
+    updates: Annotated[
+        dict[TopicName, Any],
+        Field(
+            min_length=1,
+            max_length=100,
+            description="Map of absolute topic names to values; one entry writes one topic. Results are per topic, and writes are not atomic.",
+        ),
+    ],
+    strict_type_check: Annotated[
+        bool,
+        Field(
+            description="True refuses known topic type mismatches; False attempts the write and returns warnings."
+        ),
+    ] = False,
+) -> dict:
+    """Publish one or more topic/value pairs and return per-topic results.
 
     Response:
     ``{"connected": bool, "results": {topic: bool}, "warnings": {topic: str | null}}``.
+    Writes are not atomic; partial success is reported per topic.
+    ``nt_get_topic_info`` exposes the existing NT type for mismatch checks.
     """
     if not manager.is_connected():
         return {"connected": False, "error": "NT server disconnected"}
@@ -362,9 +590,9 @@ def nt_write_topics(updates: dict[str, Any], strict_type_check: bool = False) ->
     }
 )
 async def nt_list_topics(
-    prefix: str | None = None,
-    regex: str | None = None,
-    wildcard: str | None = None,
+    prefix: PrefixFilter = None,
+    regex: RegexFilter = None,
+    wildcard: WildcardFilter = None,
 ) -> dict:
     """Return topic names, filtered by prefix, regex, and/or wildcard.
 
@@ -372,6 +600,10 @@ async def nt_list_topics(
     """
     if not manager.is_connected():
         return {"connected": False, "error": "NT server disconnected"}
+    try:
+        TopicSelector(regex=regex)
+    except ValueError as exc:
+        return {"connected": True, "error": str(exc)}
     topics = await manager.list_topics(prefix=prefix, regex=regex, wildcard=wildcard)
     return {"connected": True, "topics": topics}
 
@@ -386,16 +618,24 @@ async def nt_list_topics(
     }
 )
 async def nt_sample(
-    prefixes: list[str] | None = None,
-    duration: float = 10.0,
-    sample_interval: float | None = None,
-    change_only: float | None = None,
-    output: str = "summary",
-    limit: int | None = None,
-    max_rows: int = 5000,
-    topics: list[str] | None = None,
-    regex: str | None = None,
-    wildcard: str | None = None,
+    prefixes: SelectedPrefixes = None,
+    duration: Annotated[
+        float,
+        Field(
+            gt=0,
+            le=60,
+            allow_inf_nan=False,
+            description="Fixed sampling window in seconds, up to 60; blocks until it ends.",
+        ),
+    ] = 10.0,
+    sample_interval: SampleInterval = None,
+    change_only: ChangeThreshold = None,
+    output: OutputMode = "summary",
+    limit: OptionalRowLimit = None,
+    max_rows: RowBudget = 5000,
+    topics: SelectedTopics = None,
+    regex: RegexFilter = None,
+    wildcard: WildcardFilter = None,
 ) -> dict:
     """Sample selected live updates for a fixed window and return bounded results.
 
@@ -408,9 +648,7 @@ async def nt_sample(
     """
     if not manager.is_connected():
         return {"connected": False, "error": "NT server disconnected"}
-    selector, selector_error = _topic_selector(
-        prefixes, topics, regex, wildcard
-    )
+    selector, selector_error = _topic_selector(prefixes, topics, regex, wildcard)
     if selector_error is not None:
         return {
             "connected": True,
@@ -423,8 +661,7 @@ async def nt_sample(
             "connected": True,
             "output": output,
             "error": (
-                f"unknown output mode {output!r}; valid modes: "
-                "'summary', 'samples'"
+                f"unknown output mode {output!r}; valid modes: 'summary', 'samples'"
             ),
         }
     if selector.bare_root_only:
@@ -454,7 +691,9 @@ async def nt_sample(
         samples = {topic: rows[:limit] for topic, rows in samples.items()}
     return _bounded_events(
         {"connected": True, "samples": samples, "total_rows": total_rows},
-        "samples", output, max_rows,
+        "samples",
+        output,
+        max_rows,
     )
 
 
@@ -468,12 +707,19 @@ async def nt_sample(
     }
 )
 async def nt_start_subscription(
-    prefixes: list[str] | None = None,
-    subscription_id: str | None = None,
-    buffer_size: int = 1000,
-    topics: list[str] | None = None,
-    regex: str | None = None,
-    wildcard: str | None = None,
+    prefixes: SelectedPrefixes = None,
+    subscription_id: NewSubscriptionId = None,
+    buffer_size: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=5000,
+            description="Maximum buffered events; oldest events are discarded when full.",
+        ),
+    ] = 1000,
+    topics: SelectedTopics = None,
+    regex: RegexFilter = None,
+    wildcard: WildcardFilter = None,
 ) -> dict:
     """Open a persistent subscription and start collecting samples.
 
@@ -481,6 +727,8 @@ async def nt_start_subscription(
     ``{"connected": bool, "subscription_id": str, "started": bool}``.
     Use ``nt_poll_subscription`` to read the buffered samples in later
     turns, and ``nt_stop_subscription`` to tear it down.
+    ``nt_start_recording`` captures to a file instead; ``nt_sample`` reads
+    a fixed window in one call. Selector kinds are ANDed; list entries ORed.
     """
     if not manager.is_connected():
         return {"connected": False, "error": "NT server disconnected"}
@@ -527,7 +775,15 @@ async def nt_start_subscription(
         "openWorldHint": True,
     }
 )
-def nt_poll_subscription(subscription_id: str, clear: bool = True) -> dict:
+def nt_poll_subscription(
+    subscription_id: SubscriptionId,
+    clear: Annotated[
+        bool,
+        Field(
+            description="True clears buffered events after polling; False keeps them for another poll."
+        ),
+    ] = True,
+) -> dict:
     """Return buffered samples for a persistent subscription.
 
     Response:
@@ -560,7 +816,7 @@ def nt_poll_subscription(subscription_id: str, clear: bool = True) -> dict:
         "openWorldHint": True,
     }
 )
-async def nt_stop_subscription(subscription_id: str) -> dict:
+async def nt_stop_subscription(subscription_id: SubscriptionId) -> dict:
     """Stop a persistent subscription and free its resources."""
     task = _subscription_tasks.pop(subscription_id, None)
     _subscription_buffers.pop(subscription_id, None)
@@ -581,20 +837,22 @@ async def nt_stop_subscription(subscription_id: str) -> dict:
     }
 )
 async def nt_start_recording(
-    prefixes: list[str] | None = None,
-    sample_interval: float | None = None,
-    change_only: float | None = None,
-    max_rows: int = 5000,
-    output_dir: str | None = None,
-    topics: list[str] | None = None,
-    regex: str | None = None,
-    wildcard: str | None = None,
+    prefixes: SelectedPrefixes = None,
+    sample_interval: SampleInterval = None,
+    change_only: ChangeThreshold = None,
+    max_rows: CaptureBudget = 5000,
+    output_dir: RecordingDirectory = None,
+    topics: SelectedTopics = None,
+    regex: RegexFilter = None,
+    wildcard: WildcardFilter = None,
 ) -> dict:
     """Start an NDJSON recording and return its id immediately.
 
     Use ``nt_stop_recording(recording_id)`` after the human-controlled test
     window. The stop call closes the file and returns the compact receipt;
     do not use offline readers before it reports ``stopped: true``.
+    Selector kinds are ANDed; list entries ORed. ``nt_sample`` returns a
+    fixed window inline; ``nt_start_subscription`` buffers events for polling.
     """
     if not manager.is_connected():
         return {"connected": False, "error": "NT server disconnected"}
@@ -642,9 +900,7 @@ async def nt_start_recording(
     }
     if recorder.capture_started_at is not None:
         response["capture_started_at"] = recorder.capture_started_at
-        response["capture_started_iso"] = _iso_timestamp(
-            recorder.capture_started_at
-        )
+        response["capture_started_iso"] = _iso_timestamp(recorder.capture_started_at)
     return response
 
 
@@ -657,7 +913,7 @@ async def nt_start_recording(
         "openWorldHint": True,
     }
 )
-async def nt_stop_recording(recording_id: str) -> dict:
+async def nt_stop_recording(recording_id: RecordingId) -> dict:
     """Stop a nonblocking recording and return its compact file receipt."""
     recorder = _recorders.get(recording_id)
     task = _recording_tasks.get(recording_id)
@@ -697,7 +953,7 @@ async def nt_stop_recording(recording_id: str) -> dict:
         "openWorldHint": False,
     }
 )
-def nt_list_recordings(output_dir: str | None = None) -> list[dict]:
+def nt_list_recordings(output_dir: RecordingDirectory = None) -> list[dict]:
     """List available NDJSON recordings in the output directory.
 
     Each entry includes ``id``, ``path``, ``size_bytes``, ``modified``
@@ -717,18 +973,29 @@ def nt_list_recordings(output_dir: str | None = None) -> list[dict]:
     }
 )
 def nt_get_recording_info(
-    recording_id: str | None = None,
-    output_dir: str | None = None,
-    prefix: str | None = None,
-    regex: str | None = None,
-    wildcard: str | None = None,
-    topic_limit: int = 100,
+    recording_id: SelectedRecording = None,
+    output_dir: RecordingDirectory = None,
+    prefix: PrefixFilter = None,
+    regex: RegexFilter = None,
+    wildcard: WildcardFilter = None,
+    topic_limit: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=1000,
+            description="Maximum topic names returned, from 1 to 1000; metadata counts describe the full recording.",
+        ),
+    ] = 100,
 ) -> dict:
     """Return metadata and a bounded, filterable topic list for a recording.
 
     Includes actual capture duration, NT event timestamp span, total sample
     count, topic count, file size and timestamps. Legacy recordings without
     a metadata sidecar explicitly fall back to their event span.
+    ``topic_count`` describes the whole file; ``matching_topic_count``
+    describes names matching all filters. ``topics_returned`` and
+    ``topics_truncated`` report clipping of the sorted topic list.
+    ``nt_query_recording`` returns values; ``nt_list_recordings`` finds files.
     """
     dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
     recording_id, error = _closed_recording_id(recording_id, dir_)
@@ -757,19 +1024,19 @@ def nt_get_recording_info(
     }
 )
 def nt_query_recording(
-    prefixes: list[str] | None = None,
-    recording_id: str | None = None,
-    start: float | None = None,
-    end: float | None = None,
-    last_seconds: float | None = None,
-    limit: int = 1000,
-    max_rows: int = 5000,
-    sample_interval: float | None = None,
-    output: str = "samples",
-    output_dir: str | None = None,
-    topics: list[str] | None = None,
-    regex: str | None = None,
-    wildcard: str | None = None,
+    prefixes: SelectedPrefixes = None,
+    recording_id: SelectedRecording = None,
+    start: StartTime = None,
+    end: EndTime = None,
+    last_seconds: LastSeconds = None,
+    limit: RowLimit = 1000,
+    max_rows: RowBudget = 5000,
+    sample_interval: SampleInterval = None,
+    output: OutputMode = "samples",
+    output_dir: RecordingDirectory = None,
+    topics: SelectedTopics = None,
+    regex: RegexFilter = None,
+    wildcard: WildcardFilter = None,
 ) -> dict:
     """Return selected events from a recording.
 
@@ -781,14 +1048,12 @@ def nt_query_recording(
     min/max/mean/last per topic. ``limit`` caps entries per topic and
     ``max_rows`` caps the total across topics; the response always states
     ``rows``, ``total_rows`` and ``truncated`` so clipping is never silent.
-    A bare ``"/"`` prefix is refused — narrow it (e.g. ``/SmartDashboard/``)
-    or use the ``nt-recorder`` CLI to dump a whole recording. A final
+    A bare ``"/"`` prefix is refused; ``nt_get_recording_info`` discovers
+    topic names for a narrower query. A final
     character ceiling keeps the whole response under 60,000 serialized
     characters; any rows it drops set ``truncated: True``.
     """
-    selector, selector_error = _topic_selector(
-        prefixes, topics, regex, wildcard
-    )
+    selector, selector_error = _topic_selector(prefixes, topics, regex, wildcard)
     if selector_error is not None:
         return {
             "recording_id": recording_id,
@@ -803,8 +1068,8 @@ def nt_query_recording(
             "recording_id": recording_id,
             "error": (
                 "prefix '/' matches every topic in the recording; narrow it "
-                "(e.g. '/SmartDashboard/') or use the nt-recorder CLI to "
-                "dump the whole recording to a file"
+                "(e.g. '/SmartDashboard/'); nt_get_recording_info lists "
+                "topic names for a narrower query"
             ),
             "rows": 0,
             "total_rows": 0,
@@ -813,8 +1078,14 @@ def nt_query_recording(
     dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
     recording_id, error = _closed_recording_id(recording_id, dir_)
     if error:
-        return {"recording_id": recording_id, "error": error, "topics": {},
-                "rows": 0, "total_rows": 0, "truncated": False}
+        return {
+            "recording_id": recording_id,
+            "error": error,
+            "topics": {},
+            "rows": 0,
+            "total_rows": 0,
+            "truncated": False,
+        }
     result = nt_recorder.subscribe_offline(
         prefixes=prefixes,
         recording_id=recording_id,
@@ -831,9 +1102,14 @@ def nt_query_recording(
         wildcard=wildcard,
     )
     return _bounded_events(
-        {"recording_id": recording_id, "topics": result["topics"],
-         "total_rows": result["total_rows"]},
-        "topics", output, max_rows,
+        {
+            "recording_id": recording_id,
+            "topics": result["topics"],
+            "total_rows": result["total_rows"],
+        },
+        "topics",
+        output,
+        max_rows,
     )
 
 

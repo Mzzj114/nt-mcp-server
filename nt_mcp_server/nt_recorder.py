@@ -116,13 +116,15 @@ class Recorder:
                     # inside the async for never regain control between events).
                     try:
                         async with asyncio.timeout(self.duration):
-                            async for topic, value, time_seconds in (
-                                self.manager.subscribe_stream(
-                                    self.prefixes,
-                                    self.selected_topics,
-                                    self.regex,
-                                    self.wildcard,
-                                )
+                            async for (
+                                topic,
+                                value,
+                                time_seconds,
+                            ) in self.manager.subscribe_stream(
+                                self.prefixes,
+                                self.selected_topics,
+                                self.regex,
+                                self.wildcard,
                             ):
                                 if not self._write_filtered(
                                     file, topic, value, time_seconds
@@ -139,10 +141,7 @@ class Recorder:
                     0.0, time.monotonic() - started_monotonic
                 )
             self.topics = sorted(self._topics)
-            if (
-                self.event_started_at is not None
-                and self.event_ended_at is not None
-            ):
+            if self.event_started_at is not None and self.event_ended_at is not None:
                 self.event_span_seconds = max(
                     0.0, self.event_ended_at - self.event_started_at
                 )
@@ -197,18 +196,18 @@ class Recorder:
                     await task
 
     async def _consume(self, file) -> None:
-        async for topic, value, time_seconds in (
-            self.manager.subscribe_stream(
-                self.prefixes,
-                self.selected_topics,
-                self.regex,
-                self.wildcard,
-            )
+        async for topic, value, time_seconds in self.manager.subscribe_stream(
+            self.prefixes,
+            self.selected_topics,
+            self.regex,
+            self.wildcard,
         ):
             if not self._write_filtered(file, topic, value, time_seconds):
                 break
 
-    def _write_filtered(self, file, topic: str, value: Any, time_seconds: float) -> bool:
+    def _write_filtered(
+        self, file, topic: str, value: Any, time_seconds: float
+    ) -> bool:
         """Write one event through the decimator; update capture stats.
 
         Returns False only when ``max_capture_rows`` was reached and the
@@ -220,10 +219,7 @@ class Recorder:
         self.rows += 1
         self._topics.add(topic)
         if time_seconds > 0:
-            if (
-                self.event_started_at is None
-                or time_seconds < self.event_started_at
-            ):
+            if self.event_started_at is None or time_seconds < self.event_started_at:
                 self.event_started_at = time_seconds
             if self.event_ended_at is None or time_seconds > self.event_ended_at:
                 self.event_ended_at = time_seconds
@@ -350,9 +346,7 @@ def _matches_filters(
     return True
 
 
-def _downsample(
-    events: list[dict], sample_interval: float
-) -> list[dict]:
+def _downsample(events: list[dict], sample_interval: float) -> list[dict]:
     """Keep at most one event per ``sample_interval`` seconds."""
     if sample_interval is None or sample_interval <= 0:
         return events
@@ -493,9 +487,7 @@ def _apply_time_filter(
     return start, end
 
 
-def _meta_result(
-    payload: Any, key: str, rows: int, total_rows: int
-) -> dict[str, Any]:
+def _meta_result(payload: Any, key: str, rows: int, total_rows: int) -> dict[str, Any]:
     """Wrap a reader payload with visible-truncation metadata.
 
     ``payload`` is the per-topic dict (``subscribe_offline``) or the
@@ -586,7 +578,9 @@ def get_recording_info(
     """
     if not 1 <= topic_limit <= 1000:
         raise ValueError("topic_limit must be between 1 and 1000")
-    selector = TopicSelector([prefix] if prefix is not None else None, regex=regex, wildcard=wildcard)
+    selector = TopicSelector(
+        [prefix] if prefix is not None else None, regex=regex, wildcard=wildcard
+    )
     path = _resolve_recording(recording_id, output_dir)
     if path is None:
         return {"error": "no recording found"}
@@ -708,7 +702,10 @@ def subscribe_offline(
             continue
         out.setdefault(topic, []).append({"time": t, "value": event.get("value")})
     if sample_interval is not None:
-        out = {topic: _downsample(samples, sample_interval) for topic, samples in out.items()}
+        out = {
+            topic: _downsample(samples, sample_interval)
+            for topic, samples in out.items()
+        }
     rows = sum(len(samples) for samples in out.values())
     if format == "summary":
         out = {topic: summarize(samples) for topic, samples in out.items()}
