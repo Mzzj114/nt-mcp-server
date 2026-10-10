@@ -45,6 +45,56 @@ FIXTURE_TOPICS: list[tuple[str, str, object]] = [
 FIXTURE_NAMES = [name for name, _, _ in FIXTURE_TOPICS]
 
 
+@pytest.mark.anyio
+async def test_all_tools_publish_safety_annotations() -> None:
+    """Every registered tool exposes complete MCP safety annotations."""
+    tools = await nt_mcp_server.mcp.list_tools()
+
+    assert len(tools) == 20
+    by_name = {tool.name: tool for tool in tools}
+    assert set(by_name) == {
+        "nt_connect",
+        "nt_disconnect",
+        "nt_connection_info",
+        "nt_get",
+        "nt_get_multiple",
+        "nt_get_info",
+        "nt_set",
+        "nt_set_multiple",
+        "nt_list_topics",
+        "nt_subscribe",
+        "nt_start_subscription",
+        "nt_poll_subscription",
+        "nt_stop_subscription",
+        "nt_start_recording",
+        "nt_stop_recording",
+        "nt_list_recordings",
+        "nt_get_history",
+        "nt_get_recording_info",
+        "nt_list_topics_offline",
+        "nt_subscribe_offline",
+    }
+
+    annotation_fields = {
+        "title",
+        "readOnlyHint",
+        "destructiveHint",
+        "idempotentHint",
+        "openWorldHint",
+    }
+    for tool in tools:
+        annotations = tool.annotations
+        assert annotations is not None
+        assert annotation_fields <= set(annotations.model_dump(exclude_none=False))
+
+    assert by_name["nt_get"].annotations.readOnlyHint is True
+    assert by_name["nt_get"].annotations.openWorldHint is True
+    assert by_name["nt_set"].annotations.readOnlyHint is False
+    assert by_name["nt_set"].annotations.destructiveHint is True
+    assert by_name["nt_get_history"].annotations.readOnlyHint is True
+    assert by_name["nt_get_history"].annotations.openWorldHint is False
+
+
 async def wait_until(
     condition: Callable[[], Awaitable[bool]],
     timeout: float = 10.0,

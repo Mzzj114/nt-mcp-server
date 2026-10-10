@@ -166,7 +166,15 @@ def _clip_topic_rows(
     return clipped, kept
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Connect to NetworkTables",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
 async def nt_connect(
     server_ip: str = "127.0.0.1",
     server_port: int = 5810,
@@ -212,7 +220,15 @@ async def nt_connect(
     }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Disconnect from NetworkTables",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
 def nt_disconnect() -> dict:
     """Stop the NT4 client and tear down any persistent subscriptions."""
     _stop_all_subscriptions()
@@ -221,13 +237,29 @@ def nt_disconnect() -> dict:
     return {"connected": False, "status": "disconnected"}
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Inspect NetworkTables Connection",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
 def nt_connection_info() -> dict:
     """Return ``{"connected": bool, "connections": [...]}``."""
     return manager.connection_info()
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Read NetworkTables Topic",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
 async def nt_get(topic: str) -> dict:
     """Return the JSON-normalized value of ``topic``.
 
@@ -240,7 +272,15 @@ async def nt_get(topic: str) -> dict:
     return {"connected": True, "value": await manager.get(topic)}
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Read Multiple NetworkTables Topics",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
 async def nt_get_multiple(topics: list[str]) -> dict:
     """Return values for every requested topic.
 
@@ -251,7 +291,15 @@ async def nt_get_multiple(topics: list[str]) -> dict:
     return {"connected": True, "values": await manager.get_multiple(topics)}
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Inspect NetworkTables Topic",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
 async def nt_get_info(topic: str) -> dict:
     """Return metadata for ``topic``.
 
@@ -262,7 +310,15 @@ async def nt_get_info(topic: str) -> dict:
     return {"connected": True, "info": await manager.get_info(topic)}
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Write NetworkTables Topic",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
 def nt_set(topic: str, value: Any, strict_type_check: bool = False) -> dict:
     """Publish ``value`` to ``topic``.
 
@@ -280,7 +336,15 @@ def nt_set(topic: str, value: Any, strict_type_check: bool = False) -> dict:
     }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Write Multiple NetworkTables Topics",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
 def nt_set_multiple(updates: dict[str, Any], strict_type_check: bool = False) -> dict:
     """Write every ``{topic: value}`` pair.
 
@@ -297,7 +361,15 @@ def nt_set_multiple(updates: dict[str, Any], strict_type_check: bool = False) ->
     }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "List NetworkTables Topics",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
 async def nt_list_topics(
     prefix: str | None = None,
     regex: str | None = None,
@@ -313,7 +385,15 @@ async def nt_list_topics(
     return {"connected": True, "topics": topics}
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Capture NetworkTables Updates",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
 async def nt_subscribe(
     prefixes: list[str] | None = None,
     duration: float = 10.0,
@@ -441,7 +521,15 @@ async def nt_subscribe(
     )
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Start Persistent NetworkTables Subscription",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
 async def nt_start_subscription(
     prefixes: list[str] | None = None,
     subscription_id: str | None = None,
@@ -493,7 +581,15 @@ async def nt_start_subscription(
     }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Poll NetworkTables Subscription",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
 def nt_poll_subscription(subscription_id: str, clear: bool = True) -> dict:
     """Return buffered samples for a persistent subscription.
 
@@ -518,7 +614,15 @@ def nt_poll_subscription(subscription_id: str, clear: bool = True) -> dict:
     return {"connected": connected, "samples": samples}
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Stop NetworkTables Subscription",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
 async def nt_stop_subscription(subscription_id: str) -> dict:
     """Stop a persistent subscription and free its resources."""
     task = _subscription_tasks.pop(subscription_id, None)
@@ -530,7 +634,15 @@ async def nt_stop_subscription(subscription_id: str) -> dict:
     return {"connected": manager.is_connected(), "stopped": True}
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Start NetworkTables Recording",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
 async def nt_start_recording(
     prefixes: list[str] | None = None,
     sample_interval: float | None = None,
@@ -599,7 +711,15 @@ async def nt_start_recording(
     return response
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Stop NetworkTables Recording",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
 async def nt_stop_recording(recording_id: str) -> dict:
     """Stop a nonblocking recording and return its compact file receipt."""
     recorder = _recorders.get(recording_id)
@@ -631,7 +751,15 @@ async def nt_stop_recording(recording_id: str) -> dict:
     }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "List NetworkTables Recordings",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
 def nt_list_recordings(output_dir: str | None = None) -> list[dict]:
     """List available NDJSON recordings in the output directory.
 
@@ -642,7 +770,15 @@ def nt_list_recordings(output_dir: str | None = None) -> list[dict]:
     return nt_recorder.list_recordings(dir_)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Read NetworkTables Topic History",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
 def nt_get_history(
     topic: str,
     recording_id: str | None = None,
@@ -692,7 +828,15 @@ def nt_get_history(
     return payload
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Inspect NetworkTables Recording",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
 def nt_get_recording_info(
     recording_id: str | None = None,
     output_dir: str | None = None,
@@ -707,7 +851,15 @@ def nt_get_recording_info(
     return nt_recorder.get_recording_info(recording_id, dir_)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "List Topics in NetworkTables Recording",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
 def nt_list_topics_offline(
     recording_id: str | None = None,
     prefix: str | None = None,
@@ -720,7 +872,15 @@ def nt_list_topics_offline(
     return nt_recorder.list_topics(recording_id, dir_, prefix, regex, wildcard)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "title": "Read NetworkTables Recording Events",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
 def nt_subscribe_offline(
     prefixes: list[str] | None = None,
     recording_id: str | None = None,
