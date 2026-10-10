@@ -186,6 +186,24 @@ def _clip_topic_rows(
     return clipped, kept
 
 
+def _bounded_events(response: dict, key: str, output: str, max_rows: int) -> dict:
+    """Apply row and character budgets before reducing selected rows to summaries."""
+    rows = sum(len(items) for items in response[key].values())
+    if rows > max_rows:
+        response[key], rows = _clip_topic_rows(response[key], max_rows)
+    response["rows"] = rows
+    response["truncated"] = rows < response["total_rows"]
+    response = enforce_max_chars(response, key, _MAX_RESPONSE_CHARS)
+    if output == "summary":
+        response[key] = {topic: summarize(items) for topic, items in response[key].items()}
+        # A last_value can itself be large; summaries also need the ceiling.
+        while response[key] and len(json.dumps(response)) > _MAX_RESPONSE_CHARS:
+            topic = next(reversed(response[key]))
+            response["rows"] -= response[key].pop(topic)["count"]
+            response["truncated"] = True
+    return response
+
+
 @mcp.tool(
     annotations={
         "title": "Connect to NetworkTables",
@@ -273,35 +291,14 @@ def nt_connection_info() -> dict:
 
 @mcp.tool(
     annotations={
-        "title": "Read NetworkTables Topic",
+        "title": "Read NetworkTables Topics",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": True,
     }
 )
-async def nt_get(topic: str) -> dict:
-    """Return the JSON-normalized value of ``topic``.
-
-    Response: ``{"connected": bool, "value": jsonable | null}`` when
-    connected, or ``{"connected": false, "error": "..."}`` when
-    disconnected.
-    """
-    if not manager.is_connected():
-        return {"connected": False, "error": "NT server disconnected"}
-    return {"connected": True, "value": await manager.get(topic)}
-
-
-@mcp.tool(
-    annotations={
-        "title": "Read Multiple NetworkTables Topics",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    }
-)
-async def nt_get_multiple(topics: list[str]) -> dict:
+async def nt_read_topics(topics: list[str]) -> dict:
     """Return values for every requested topic.
 
     Response: ``{"connected": bool, "values": {topic: value}}``.
@@ -320,7 +317,7 @@ async def nt_get_multiple(topics: list[str]) -> dict:
         "openWorldHint": True,
     }
 )
-async def nt_get_info(topic: str) -> dict:
+async def nt_get_topic_info(topic: str) -> dict:
     """Return metadata for ``topic``.
 
     Response: ``{"connected": bool, "info": {...} | null}``.
@@ -332,40 +329,14 @@ async def nt_get_info(topic: str) -> dict:
 
 @mcp.tool(
     annotations={
-        "title": "Write NetworkTables Topic",
+        "title": "Write NetworkTables Topics",
         "readOnlyHint": False,
         "destructiveHint": True,
         "idempotentHint": False,
         "openWorldHint": True,
     }
 )
-def nt_set(topic: str, value: Any, strict_type_check: bool = False) -> dict:
-    """Publish ``value`` to ``topic``.
-
-    Response: ``{"connected": bool, "ok": bool, "warning": str | null}``.
-    ``strict_type_check=True`` refuses mismatched writes instead of only
-    warning about them.
-    """
-    if not manager.is_connected():
-        return {"connected": False, "error": "NT server disconnected"}
-    res = manager.set(topic, value, strict_type_check=strict_type_check)
-    return {
-        "connected": True,
-        "ok": res["ok"],
-        "warning": res["warning"],
-    }
-
-
-@mcp.tool(
-    annotations={
-        "title": "Write Multiple NetworkTables Topics",
-        "readOnlyHint": False,
-        "destructiveHint": True,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    }
-)
-def nt_set_multiple(updates: dict[str, Any], strict_type_check: bool = False) -> dict:
+def nt_write_topics(updates: dict[str, Any], strict_type_check: bool = False) -> dict:
     """Write every ``{topic: value}`` pair.
 
     Response:
@@ -407,49 +378,33 @@ async def nt_list_topics(
 
 @mcp.tool(
     annotations={
-        "title": "Capture NetworkTables Updates",
-        "readOnlyHint": False,
+        "title": "Sample NetworkTables Updates",
+        "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
     }
 )
-async def nt_subscribe(
+async def nt_sample(
     prefixes: list[str] | None = None,
     duration: float = 10.0,
     sample_interval: float | None = None,
     change_only: float | None = None,
-    output: str = "file",
+    output: str = "summary",
     limit: int | None = None,
     max_rows: int = 5000,
-    output_dir: str | None = None,
     topics: list[str] | None = None,
     regex: str | None = None,
     wildcard: str | None = None,
 ) -> dict:
-    """Sample selected value updates for ``duration`` seconds.
+    """Sample selected live updates for a fixed window and return bounded results.
 
-    ``prefixes`` and exact ``topics`` are ORed within their lists; selector
-    kinds are ANDed together. ``regex`` searches the full topic name and
-    ``wildcard`` uses shell-style globbing. At least one selector is required.
-
-    ``output`` supersedes the removed ``format`` parameter and defaults
-    to ``"file"``: the same window is captured to an NDJSON recording
-    (nt-recorder format, written into ``output_dir`` or
-    ``NT_RECORDINGS_DIR``) and the response is a compact receipt —
-    ``recording_id``, ``path``, capture-clock and event-span timing, ``rows``,
-    ``topic_count``, the first 50 ``topics`` and ``truncated`` — with NO
-    sample values.
-    ``output="summary"`` returns min/max/mean/last per topic;
-    ``output="samples"`` returns raw ``{topic: [{"time", "value"}, ...]}``.
-    Both inline modes are bounded: ``limit`` caps each topic's samples,
-    ``max_rows`` caps the total, and a final character ceiling keeps the
-    whole response under 60,000 serialized characters — every drop
-    states ``truncated: True``. Inline modes refuse a bare ``"/"``
-    prefix: narrow it (e.g. ``/SmartDashboard/``) or use
-    ``output="file"``. ``sample_interval`` decimates events to one per
-    topic per interval; ``change_only`` skips numeric changes at or
-    below the threshold.
+    Returns ``samples`` keyed by topic, ``rows``, ``total_rows`` and
+    ``truncated``. Summary mode returns statistics over retained samples;
+    samples mode returns timestamp/value rows. Selectors are ANDed across
+    kinds and ORed within lists. A bare "/" prefix is refused.
+    ``nt_start_recording`` captures a human-controlled window to a file;
+    ``nt_start_subscription`` buffers updates for later polling.
     """
     if not manager.is_connected():
         return {"connected": False, "error": "NT server disconnected"}
@@ -463,44 +418,23 @@ async def nt_subscribe(
             "error": selector_error,
         }
     assert selector is not None
-    if output not in ("file", "summary", "samples"):
+    if output not in ("summary", "samples"):
         return {
             "connected": True,
             "output": output,
             "error": (
                 f"unknown output mode {output!r}; valid modes: "
-                "'file' (default, writes an NDJSON recording), "
                 "'summary', 'samples'"
             ),
         }
-    if output != "file" and selector.bare_root_only:
+    if selector.bare_root_only:
         return {
             "connected": True,
             "output": output,
             "error": (
                 "prefix '/' matches every topic; narrow it "
-                "(e.g. '/SmartDashboard/') or use output='file' to capture "
-                "the same window into an NDJSON recording"
+                "(e.g. '/SmartDashboard/') or use nt_start_recording"
             ),
-        }
-    if output == "file":
-        dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
-        recorder = nt_recorder.Recorder(
-            manager,
-            output_dir=dir_,
-            prefixes=prefixes,
-            duration=duration,
-            sample_interval=sample_interval,
-            change_only=change_only,
-            max_capture_rows=max_rows,
-            topics=topics,
-            regex=regex,
-            wildcard=wildcard,
-        )
-        path = await recorder.run()
-        return {
-            "connected": True,
-            **_recording_receipt(recorder, path),
         }
     # Inline modes: collect raw samples, enforce the total row budget,
     # then reduce summaries from what survived the clip.
@@ -510,34 +444,17 @@ async def nt_subscribe(
         sample_interval=sample_interval,
         change_only=change_only,
         format="samples",
-        limit=limit,
+        limit=None,
         topics=topics,
         regex=regex,
         wildcard=wildcard,
     )
-    rows = sum(len(topic_samples) for topic_samples in samples.values())
-    truncated = False
-    if rows > max_rows:
-        samples, rows = _clip_topic_rows(samples, max_rows)
-        truncated = True
-    if output == "summary":
-        samples = {
-            topic: summarize(topic_samples)
-            for topic, topic_samples in samples.items()
-        }
-    # Outermost guard: the row budgets above bound the row COUNT, but a
-    # single sample's value can be large enough to overflow the ceiling.
-    # Summary containers hold no row lists, so the guard passes them
-    # through untouched.
-    return enforce_max_chars(
-        {
-            "connected": True,
-            "samples": samples,
-            "rows": rows,
-            "truncated": truncated,
-        },
-        "samples",
-        _MAX_RESPONSE_CHARS,
+    total_rows = sum(len(rows) for rows in samples.values())
+    if limit is not None:
+        samples = {topic: rows[:limit] for topic, rows in samples.items()}
+    return _bounded_events(
+        {"connected": True, "samples": samples, "total_rows": total_rows},
+        "samples", output, max_rows,
     )
 
 
@@ -907,38 +824,16 @@ def nt_query_recording(
         last_seconds=last_seconds,
         limit=limit,
         sample_interval=sample_interval,
-        format=output,
+        format="samples",
         return_meta=True,
         topics=topics,
         regex=regex,
         wildcard=wildcard,
     )
-    topic_payload = (
-        result["topics"] if output != "summary" else result["summary"]
-    )
-    rows = result["rows"]
-    total_rows = result["total_rows"]
-    truncated = result["truncated"]
-    if output != "summary" and rows > max_rows:
-        # Enforce the total budget truthfully: clip per-topic lists until
-        # the sum fits, then recompute rows/truncated from what remains.
-        # Summary payloads are one small dict per topic - no row clip.
-        topic_payload, rows = _clip_topic_rows(topic_payload, max_rows)
-        truncated = True
-    # Outermost guard: the row budgets above bound the row COUNT, but a
-    # single row's value can be large enough that 5000 rows still serialize
-    # past the ceiling. enforce_max_chars drops rows until the whole
-    # envelope fits 60,000 characters and keeps rows/truncated truthful.
-    return enforce_max_chars(
-        {
-            "recording_id": recording_id,
-            "topics": topic_payload,
-            "rows": rows,
-            "total_rows": total_rows,
-            "truncated": truncated,
-        },
-        "topics",
-        _MAX_RESPONSE_CHARS,
+    return _bounded_events(
+        {"recording_id": recording_id, "topics": result["topics"],
+         "total_rows": result["total_rows"]},
+        "topics", output, max_rows,
     )
 
 
