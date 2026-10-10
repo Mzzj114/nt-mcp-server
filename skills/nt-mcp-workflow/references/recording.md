@@ -47,7 +47,7 @@ Files are named `nt-record-<YYYY-MM-DDTHHMMSSZ>.ndjson`. The timestamp is UTC, c
 
 ### Environment variable
 
-`NT_RECORDINGS_DIR` sets the default output directory for both the CLI and the offline MCP tools. When unset, both default to `./recordings`. The `--output-dir` flag overrides this for the CLI.
+`NT_RECORDINGS_DIR` sets the default directory for MCP recording and offline tools. When unset they default to `./recordings`. The CLI uses `--output-dir` (default `./recordings`).
 
 ## Running detached on Windows
 
@@ -79,36 +79,28 @@ This finds any `python.exe` whose command line contains `nt-recorder` and force-
 
 A live recorder left running keeps growing the output file and mixes data from different test runs (enabled windows, disabled windows, different tuning configurations). Always stop the recorder before starting a new session. If you are using the detached-on-Windows pattern, run the stop command above before launching a new recorder.
 
-## The newer path: live capture via `nt_subscribe`
+## MCP recording lifecycle
 
-The `nt_subscribe` MCP tool's default `output="file"` mode produces the same NDJSON format as `nt-recorder`. Instead of running a separate CLI process, the agent calls the tool, which captures the window into a recording file and returns a compact receipt:
+`nt_start_recording` starts an NDJSON recording and immediately returns its ID and path. Select with `prefixes`, exact `topics`, `regex` or `wildcard`; list entries are ORed, selector kinds are ANDed. A bare `"/"` prefix is allowed for file capture.
 
-```json
-{
-  "connected": true,
-  "output": "file",
-  "recording_id": "nt-record-2026-09-15T143022Z.ndjson",
-  "path": "/path/to/recordings/nt-record-2026-09-15T143022Z.ndjson",
-  "duration_seconds": 10.0,
-  "rows": 847,
-  "topic_count": 12,
-  "topics": ["/SmartDashboard/Pose X", "..."],
-  "topics_truncated": false,
-  "truncated": false
-}
+```python
+nt_start_recording(prefixes=["/SmartDashboard/"], max_rows=100000)
+# Perform the human-controlled test.
+nt_stop_recording(recording_id="nt-record-...ndjson")
 ```
 
-The receipt contains no sample values. To inspect the captured data, window into it with the offline tools (`nt_get_history`, `nt_subscribe_offline`). This keeps the agent context small: capture is a file write, analysis is a separate read.
+The start call returns `{connected, recording_id, path, started}` plus capture start time. The stop call closes the file and returns a value-free receipt: `stopped`, `recording_id`, `path`, capture start/end, `capture_duration_seconds`, `event_span_seconds`, `rows`, `topic_count`, bounded `topics`, `topics_truncated` and `truncated`. `duration_seconds` is the actual capture duration. The row cap defaults to 5000 (maximum 1,000,000); reaching it ends capture early and the receipt reports truncation. The stop call still retrieves the final receipt.
 
-Both paths (CLI recorder and tool-based capture) write the same three-column NDJSON, so an offline workflow works identically regardless of how the recording was produced.
+MCP recording filenames include a short unique suffix so starts within the same second do not overwrite each other. New recordings also have a sibling `.meta.json` sidecar. Capture duration is measured by the recorder clock; NT event timestamps may include older immediate values, so event span is reported separately.
+
+After `nt_stop_recording` reports `stopped: true`, pass its ID to the offline tools. The MCP tools refuse to inspect active recordings managed by the server. The separate CLI recorder must be stopped before its file is read, too.
+
+For a short observation that should return values inline, `nt_sample(duration=3, topics=[...])` returns summary statistics by default. It has no file mode.
 
 ## Offline analysis
 
-Once you have a recording, use the offline MCP tools to inspect it:
+1. `nt_list_recordings` finds available files when you do not already have an ID.
+2. `nt_get_recording_info(recording_id=...)` returns timing, sample counts and bounded topic discovery. Filter names with `prefix`, `regex` or `wildcard`; `topic_limit` defaults to 100.
+3. `nt_query_recording(topics=[...], recording_id=..., output="summary")` queries one or multiple exact topics. Prefix, regex and wildcard queries are supported too. `output="samples"` returns raw rows and is the default.
 
-1. `nt_list_recordings` to find available files.
-2. `nt_get_recording_info(recording_id=...)` for a quick overview (duration, sample count, topic count).
-3. `nt_list_topics_offline(recording_id=...)` to discover which topics are present.
-4. `nt_subscribe_offline(prefixes=[...], recording_id=...)` or `nt_get_history(topic=..., recording_id=...)` to pull samples.
-
-See `references/replay-recording.md` for the full offline workflow.
+Both recording paths write the same NDJSON shape. See `references/replay-recording.md` for windowing and bounds.

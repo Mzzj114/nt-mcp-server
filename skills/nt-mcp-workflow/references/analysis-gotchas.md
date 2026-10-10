@@ -50,6 +50,8 @@ The NT4 protocol is the current standard and is what these tools speak. The NT3 
 
 The offline reader functions (`get_history`, `subscribe_offline`, `list_recordings`, etc.) have no writer-detection. They open the file, read what is there, and return. If a `Recorder` process is still appending lines, the reader may see a partial file: some lines are fully written, others are mid-write, and the file size is still growing.
 
+The MCP tools `nt_get_recording_info` and `nt_query_recording` reject active recordings managed by that MCP server. This does not detect a separate CLI recorder, which must be stopped before analysis.
+
 This can produce truncated results, JSON parse errors, or silently incomplete data. Always stop the recorder before reading its output file. If you are using the detached-on-Windows pattern, run the stop command first.
 
 This is documented in the source at `nt_recorder.py` and was a real failure mode during the investigation: an agent tried to analyze a recording while the recorder was still running and got garbled results.

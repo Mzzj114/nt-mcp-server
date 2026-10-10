@@ -57,41 +57,56 @@ Verify the connection with `opencode mcp list`.
 
 ## Tools
 
-The server exposes 20 tools (15 live + 5 offline). Every live tool response includes a `connected` flag.
+The server exposes 16 tools (13 live + 3 offline). Every live response includes a `connected` flag. Reads and writes have separate tools.
 
 ### Live tools
 
 | Tool | Description |
 | --- | --- |
-| `nt_connect` | Start the NT4 client and wait for a live connection. Pass exactly one target: `team_number`, or `server_ip`/`server_port` with the default `server_ip`. Parameters: `server_ip="127.0.0.1"`, `server_port=5810`, `team_number=None`, `identity="nt-mcp"`, `timeout_seconds=5.0`. Success returns `{"connected": true, "status": "connected", "target": {...}}` where `target` reports the resolved target (e.g. `{"kind": "server", "server_ip": "127.0.0.1", "server_port": 5810}` or `{"kind": "team", "team_number": 8326, "server_port": 5810}`). Two refusals return `{"connected": false, "error": ...}`: an ambiguous target (both `team_number` and a non-default `server_ip`) is rejected before any state change, and re-targeting a running client is rejected — call `nt_disconnect` first. On timeout the response adds `connections` diagnostics, `elapsed_seconds`, and a routing `hint`. The `team_number` path resolves robot addresses via pyntcore's team-number lookup; the exact address list is not yet verified against real hardware, so the resolved `target` is reported rather than assumed. |
-| `nt_disconnect` | Stop the NT4 client and tear down persistent subscriptions. Returns `{"connected": false, "status": "disconnected"}`. |
-| `nt_connection_info` | Return connection state: `{"connected": bool, "connections": [{"remote_id", "remote_ip", "last_update"}], "target": resolved_target \| null, "version": str}`. `target` is the resolved connect target (null before the first connect); `version` is the installed package version (`"unknown"` when metadata is absent). |
-| `nt_get` | Return the JSON-normalized value of one topic. Response: `{"connected": bool, "value": jsonable \| null}`. |
-| `nt_get_multiple` | Return every requested topic. Response: `{"connected": bool, "values": {topic: value}}`. |
-| `nt_get_info` | Return topic metadata. Response: `{"connected": bool, "info": {name, type_str, properties} \| null}`. |
-| `nt_set` | Publish a value. Response: `{"connected": bool, "ok": bool, "warning": str \| null}`. Add `strict_type_check=True` to refuse type mismatches. |
-| `nt_set_multiple` | Write every `{topic: value}` pair. Response: `{"connected": bool, "results": {...}, "warnings": {...}}`. |
-| `nt_list_topics` | List topic names, filtered by `prefix`, `regex`, and/or `wildcard`. Response: `{"connected": bool, "topics": [...]}`. |
-| `nt_subscribe` | Sample selected updates for `duration` seconds. Select with `prefixes`, exact `topics`, `regex`, and/or `wildcard`; values within a list are ORed and selector kinds are ANDed. `output` defaults to `"file"`, which writes NDJSON and returns a compact receipt with **no sample values**. Inline `"summary"` / `"samples"` modes are bounded by per-topic `limit`, total `max_rows` (default 5000), and a 60,000-character ceiling. An unqualified bare `"/"` is refused inline, while `"/"` combined with another narrowing selector is allowed. `sample_interval` and `change_only` decimate events. |
-| `nt_start_subscription` | Open a persistent subscription using `prefixes`, exact `topics`, `regex`, and/or `wildcard`. Response: `{"connected": bool, "subscription_id": str, "started": bool}`. |
-| `nt_poll_subscription` | Read buffered samples from a persistent subscription. Response: `{"connected": bool, "samples": {topic: [...]}}`. |
-| `nt_stop_subscription` | Stop a persistent subscription. Response: `{"connected": bool, "stopped": bool}`. |
-| `nt_start_recording` | Start a nonblocking NDJSON recording with the same topic selectors and immediately return its `recording_id`; intended for human-controlled test windows. |
-| `nt_stop_recording` | Close a nonblocking recording and return the same compact, value-free receipt as file-mode `nt_subscribe`. |
+| `nt_connect` | Start the NT4 client and wait for a connection. Defaults to `127.0.0.1:5810`; choose `team_number` or `server_ip`/`server_port`. Conflicting targets and re-targeting a running client are refused; disconnect first. Returns the resolved target or timeout diagnostics. |
+| `nt_disconnect` | Stop the client, tear down persistent subscriptions and request active recordings to close. |
+| `nt_connection_info` | Return connection state, remote peers, resolved target and package version. |
+| `nt_read_topics` | Read one or more exact `topics`. Returns `{connected, values: {topic: value}}`; unknown topics have null values. |
+| `nt_get_topic_info` | Return one topic's name, NT type and properties, or null if unknown. |
+| `nt_write_topics` | Publish an `updates` map, including a single-entry map. Returns per-topic `results` and `warnings`. `strict_type_check=True` refuses known type mismatches. Writes are not atomic. |
+| `nt_list_topics` | Discover live topic names with optional `prefix`, `regex` and `wildcard` filters. |
+| `nt_sample` | Observe selected updates for `duration` seconds (up to 60). Defaults to `output="summary"`; `output="samples"` returns timestamp/value rows. Returns `samples` keyed by topic, `rows`, `total_rows` and `truncated`. |
+| `nt_start_subscription` | Start a persistent in-memory subscription and return its `subscription_id`. `buffer_size` bounds retained events; oldest events are discarded when full. |
+| `nt_poll_subscription` | Read buffered events; `clear=True` clears them after polling. |
+| `nt_stop_subscription` | Stop the subscription and free its resources. |
+| `nt_start_recording` | Start an NDJSON recording and immediately return its `recording_id` and path for a human-controlled test window. |
+| `nt_stop_recording` | Close a recording and return a compact receipt with timing, row count, topic names and truncation flags, without sample values. |
+
+Live sampling, subscriptions, recordings and recording queries share `prefixes`, exact `topics`, `regex` and `wildcard` selectors. Entries within a list are ORed; different selector kinds are ANDed. At least one selector is required. A bare `prefixes=["/"]` is allowed for recordings, but refused for inline sampling and recording queries unless another selector narrows it.
+
+`nt_sample` blocks for its fixed window and returns inline results. For an interactive test, call `nt_start_recording`, perform the test, then call `nt_stop_recording`. Use the returned ID for offline analysis after the file closes.
 
 ### Offline recording tools
 
 | Tool | Description |
 | --- | --- |
-| `nt_list_recordings` | List recordings. Each entry includes file metadata plus persisted capture-clock and NT event-span timing when available. |
-| `nt_get_recording_info` | Return capture duration, event timestamp span, total sample count, topic count, and file metadata. Legacy recordings without a metadata sidecar report `duration_source="event_span"`. |
-| `nt_get_history` | Return event history for one topic. Supports `last_seconds`, `sample_interval`, and `format="summary"`. The response always states `rows` (entries returned), `total_rows` (all matching events, counted even past the clip), and `truncated` (`total_rows > rows`, or the 60,000-character ceiling dropped rows) so clipping is never silent. |
-| `nt_list_topics_offline` | List unique topic names in a recording, filtered by `prefix`, `regex`, and/or `wildcard`. |
-| `nt_subscribe_offline` | Return recorded events selected by `prefixes`, exact `topics`, `regex`, and/or `wildcard`. Supports `last_seconds`, `sample_interval`, and `format="summary"`. `limit` (default 1000 per topic), `max_rows` (default 5000 total), and the character ceiling bound the payload; `rows` / `total_rows` / `truncated` make clipping visible. |
+| `nt_list_recordings` | List available files, newest first, with file metadata and persisted capture timing when available. |
+| `nt_get_recording_info` | Return capture duration, NT event span, sample count, file metadata and a sorted topic list. `prefix`, `regex` and `wildcard` filter topic discovery; `topic_limit` defaults to 100 (maximum 1000). `topic_count` describes the whole file; `matching_topic_count`, `topics_returned` and `topics_truncated` describe discovery. |
+| `nt_query_recording` | Query selected topics. Returns `{recording_id, topics, rows, total_rows, truncated}`. Defaults to `output="samples"`; `output="summary"` returns statistics under the same `topics` key. Supports `start` (inclusive), `end` (exclusive), `last_seconds` and `sample_interval`. |
 
-The offline tools read from the directory set by the `NT_RECORDINGS_DIR` environment variable (defaults to `./recordings`). Recordings are local-only — the recorder runs on the dev laptop and reads NT from the sim/robot; no robot-side changes are needed.
+The offline directory defaults to `NT_RECORDINGS_DIR` or `./recordings`; `output_dir` overrides it. Omitting `recording_id` selects the most recently modified recording. Queries return the resolved ID. The MCP tools refuse to inspect a recording still being written by this server; a separate CLI recorder must also be stopped before analysis.
 
-The `nt-recorder` CLI also supports `--team N` to connect via team number; the MCP `nt_connect` tool exposes the same choice via `team_number`.
+For one topic's history:
+
+```python
+nt_query_recording(
+    topics=["/SmartDashboard/Swerve/Pose X"],
+    recording_id="nt-record-...ndjson",
+    last_seconds=5,
+    output="summary",
+)
+```
+
+Inline sampling and offline queries are bounded by per-topic `limit`, total `max_rows` (default 5000, maximum 5000) and a 60,000-character ceiling. Summary statistics describe retained rows; `rows` / `total_rows` / `truncated` report reduction explicitly. Offline `total_rows` counts matching events before limits and decimation; live `total_rows` counts events after sampling/change filters and before output clipping. `last_seconds` uses the latest NT event timestamp, which can differ from the capture clock.
+
+Each new recording has a sibling `.meta.json` sidecar. `capture_duration_seconds` measures capture time; `event_span_seconds` measures the range of NT last-change timestamps, including older immediate values. Legacy files without sidecars report `duration_source="event_span"`.
+
+The `nt-recorder` CLI remains available independently of MCP, including `--team N` for robot address lookup. Recordings are local to the server host; no robot-side changes are needed.
 
 ## Development
 
@@ -122,6 +137,23 @@ For a real robot, connect the development machine to the robot network and call 
 
 
 ## Release notes
+
+### 0.3.0 — consolidated tool surface
+
+The exposed MCP surface changes from 20 to 16 tools. Restart the MCP server/client to refresh tool discovery. These are breaking name and argument changes:
+
+| Previous call | Replacement |
+| --- | --- |
+| `nt_get(topic)` / `nt_get_multiple(topics)` | `nt_read_topics(topics=[...])`; values are always keyed by topic |
+| `nt_set(topic, value)` / `nt_set_multiple(updates)` | `nt_write_topics(updates={topic: value})`; results/warnings are always keyed by topic |
+| `nt_get_info(topic)` | `nt_get_topic_info(topic)` |
+| `nt_subscribe(output="summary")` or `output="samples"` | `nt_sample(output=...)`; defaults to summary and has no file mode |
+| `nt_subscribe(output="file")` | `nt_start_recording(...)`, then `nt_stop_recording(recording_id)` |
+| `nt_get_history(topic, ...)` | `nt_query_recording(topics=[topic], ...)`; read `topics[topic]` |
+| `nt_subscribe_offline(format=...)` | `nt_query_recording(output=...)` |
+| `nt_list_topics_offline(...)` | `nt_get_recording_info(...)`; read `topics` and discovery counts |
+
+Schemas describe every parameter and enforce output enums, absolute topic names, non-empty batches, positive sampling intervals, row budgets, port ranges and filename-only recording IDs. Offline reader functions in `nt_recorder` retain their Python API.
 
 ### 0.2.0 — breaking changes
 

@@ -34,25 +34,22 @@ Wait a few seconds for the robot/sim to boot, then proceed with the chosen workf
 1. `nt_connect` — start the NT4 client. Defaults to `127.0.0.1:5810` for the sim.
 2. `nt_connection_info` — confirm the remote IP and that the link is up.
 3. `nt_list_topics` — list available topics, optionally filtered by `prefix`.
-4. `nt_get_info` — inspect a topic's type and properties before writing, so you know whether it is a `double`, `string`, `double[]`, etc.
-5. `nt_get` / `nt_get_multiple` — read current values.
+4. `nt_get_topic_info` — inspect a topic's type and properties before writing, so you know whether it is a `double`, `string`, `double[]`, etc.
+5. `nt_read_topics(topics=[...])` — read current values, including a single topic. Values are keyed by topic.
 
 ## 4. Drive and observe
 
-1. `nt_set` / `nt_set_multiple` — publish inputs such as a `/SmartDashboard/MCP/*` setpoint the robot reads.
-2. `nt_subscribe` — watch telemetry for a bounded duration. The default `output="file"` captures the window into an NDJSON recording (same format as `nt-recorder`, written into `output_dir` or `NT_RECORDINGS_DIR`, default `./recordings`) and returns a compact receipt — `recording_id`, `path`, `duration_seconds`, `rows`, `topic_count`, the first 50 `topics` (with `topics_truncated`), and `truncated` — with **no sample values**. Window into the recording afterwards with `nt_get_history` / `nt_subscribe_offline`. This keeps capture out of your context; see `references/recording.md`.
+1. `nt_write_topics(updates={...})` — publish inputs such as a `/SmartDashboard/MCP/*` setpoint the robot reads.
+2. `nt_sample` — watch selected telemetry for a fixed duration (up to 60 seconds). Defaults to `output="summary"` (statistics over retained samples); `output="samples"` returns raw timestamp/value rows. Results are under `samples`, keyed by topic.
+   - `limit` caps retained samples per topic (default None); `max_rows` caps the total (default/maximum 5000).
+   - The 60,000-character ceiling applies to both modes. `rows`, `total_rows` and `truncated` report reduction.
+   - Select with `prefixes`, exact `topics`, `regex` or `wildcard`. Entries within a list are ORed; selector kinds are ANDed. A bare `"/"` prefix requires another narrowing selector.
+   - `sample_interval` decimates events; `change_only` skips small numeric changes or unchanged non-numeric values.
+   - Example: `nt_sample(topics=["/SmartDashboard/Swerve/Pose X"], duration=3, sample_interval=0.5)`.
 
-   For a small inline response instead, use `output="summary"` (min/max/mean/last per topic) or `output="samples"` (raw samples). Both inline modes are bounded:
-   - `limit` — cap the number of returned samples **per topic** (default `None`, uncapped).
-   - `max_rows` — cap the total samples across all topics (default 5000).
-   - A final character ceiling keeps the whole response under 60,000 serialized characters; every drop states `truncated: true`.
-   - Inline modes refuse a bare `"/"` prefix — narrow it (e.g. `/SmartDashboard/`) or use `output="file"`.
+   For a human-controlled test, `nt_start_recording` returns immediately. Perform the test, then `nt_stop_recording(recording_id)` closes the file and returns a receipt. Analyze with `nt_get_recording_info` and `nt_query_recording`; see `references/recording.md`.
 
-   Note: `output` supersedes the removed `format` parameter. An older version of this skill documented `format="summary"` — pass `output="summary"` now.
-
-   Other knobs: `sample_interval` decimates to one sample per N seconds per topic; `change_only` skips samples that barely changed (great for mostly-static values; a spinning pose still streams); `duration` is how long to collect.
-
-   Example: `nt_subscribe(prefixes=["/SmartDashboard/Swerve"], duration=3, sample_interval=0.5, change_only=0.01)`.
+   For repeated live checks, `nt_start_subscription` opens a bounded buffer, `nt_poll_subscription` reads it, and `nt_stop_subscription` closes it.
 
 3. `nt_disconnect` — tear down the connection when finished.
 

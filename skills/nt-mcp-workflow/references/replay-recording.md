@@ -1,65 +1,57 @@
 # Offline recording workflow
 
-Use this workflow when you have a saved `.ndjson` recording and the robot or sim is not running. It is ideal for whole-match forensics, transient issues you could not reproduce live, or post-event analysis.
+Use this workflow for a saved `.ndjson` recording, including transient issues or post-test analysis. Live NT is not required.
 
-Recordings are stored in the directory set by `NT_RECORDINGS_DIR` (default `./recordings`). They are plain NDJSON: each line is `{"time": float, "topic": str, "value": jsonable}`.
+Recordings are stored on the MCP server host in `NT_RECORDINGS_DIR` (default `./recordings`). Each line is `{"time": float, "topic": str, "value": jsonable}`. New files have a sibling `.meta.json` timing sidecar.
 
-## 0. Produce a recording (if you do not have one yet)
+## 0. Produce a recording
 
-Two ways, both writing the same NDJSON format — see `references/recording.md` for full details:
+- `nt-recorder` CLI records until stopped or `--duration` elapses.
+- `nt_start_recording(prefixes=[...])` returns an ID immediately. Perform the test, then `nt_stop_recording(recording_id)` closes the file and returns its receipt without sample values.
 
-- `nt-recorder` CLI — standalone process, records until stopped or `--duration` elapses.
-- `nt_subscribe(prefixes=[...], duration=N)` — the live MCP tool with its default `output="file"` captures a bounded window and returns a compact receipt instead of sample values:
+Stop the recording before analysis. Reuse the receipt's ID; discovery is unnecessary when the ID is already known. See `references/recording.md`.
 
-  ```json
-  {
-    "connected": true,
-    "output": "file",
-    "recording_id": "nt-record-2026-09-15T143022Z.ndjson",
-    "path": "recordings/nt-record-2026-09-15T143022Z.ndjson",
-    "duration_seconds": 10.0,
-    "rows": 847,
-    "topic_count": 12,
-    "topics": ["/SmartDashboard/Pose X", "..."],
-    "topics_truncated": false,
-    "truncated": false
-  }
-  ```
+## 1. Discover telemetry
 
-  The receipt contains no sample values — pass `recording_id` from it to the offline tools below to window into the capture.
-
-## 1. Discover the telemetry
-
-Search the codebase for `SmartDashboard`, `NetworkTables`, and `Field2d` to find which topics the robot publishes or subscribes to. For example:
-
-- `subsystems/swerve_drive.py` publishing `/SmartDashboard/Swerve/Pose X`, `/SmartDashboard/Swerve/Pose Y`, `/SmartDashboard/Swerve/Pose Theta`, and a `Field2d` at `/SmartDashboard/Field`.
-- Subsystems publishing encoder counts, voltages, setpoints, motor currents, etc.
+Search robot code for `SmartDashboard`, `NetworkTables` and `Field2d` to understand topic meanings and the expected behavior. Topic names published through SmartDashboard include `/SmartDashboard/`.
 
 ## 2. Inspect the recording
 
-1. `nt_list_recordings` — list files with size, `modified_iso`, and path. You usually want the most recent recording.
-2. `nt_get_recording_info(recording_id=...)` — get duration, `total_samples`, and `topic_count` for a quick overview before opening it.
-3. `nt_list_topics_offline(recording_id=...)` — list the topics present in the recording, optionally filtered by `prefix`, `regex`, or `wildcard`.
+1. `nt_list_recordings` finds available files, newest first, when the ID is unknown.
+2. `nt_get_recording_info(recording_id=...)` returns duration, `total_samples`, `topic_count` and sorted `topics`. Optional `prefix`, `regex` and `wildcard` filters are ANDed for topic discovery; `topic_limit` defaults to 100 (maximum 1000). The overview still describes the whole file. `matching_topic_count`, `topics_returned` and `topics_truncated` report filtered discovery and clipping.
 
-## 3. Replay samples
+`capture_duration_seconds` is actual capture time. `event_span_seconds` is the span of NT timestamps, possibly including older immediate values. Legacy files without sidecars report `duration_source="event_span"`.
 
-1. `nt_subscribe_offline(prefixes=[...], recording_id=...)` — replay samples from the recording. The response carries `recording_id`, `topics` (or `summary` with `format="summary"`), and always `rows`, `total_rows`, and `truncated`. Knobs:
-   - `sample_interval` — decimate to one sample per N seconds.
-   - `limit` — cap the entries returned **per topic** (default 1000).
-   - `max_rows` — cap the total entries across topics (default 5000).
-   - `format` — `"samples"` (default) or `"summary"` (min/max/mean/last).
-   - `last_seconds` / `start` / `end` — window the replay.
-   - A bare `"/"` prefix is refused — narrow it (e.g. `/SmartDashboard/`).
-2. `nt_get_history(topic=..., recording_id=...)` — pull one topic's history. The response carries `topic`, `recording_id`, `rows`, `total_rows`, `truncated`, and `samples` (or `summary`). Windowing:
-   - `last_seconds` — the most recent N seconds.
-   - `start` / `end` — an explicit time window using NT4 timestamps.
-   - `limit` — cap the returned entries (default 5000).
+## 3. Query samples or summaries
 
-   Example: `nt_get_history(topic="/SmartDashboard/Swerve/Pose X", recording_id="nt-record-...ndjson", last_seconds=5)`.
+`nt_query_recording` handles both single-topic history and multi-topic reads:
 
-If `truncated` is `true`, then `rows` < `total_rows`: you are looking at a subset, never treat it as complete. Narrow the prefix, shrink the time window, or raise the row budget. See the truncation section in `references/analysis-gotchas.md`.
+```python
+nt_query_recording(
+    recording_id="nt-record-...ndjson",
+    topics=["/SmartDashboard/Swerve/Pose X", "/SmartDashboard/Swerve/Pose Y"],
+    last_seconds=5,
+    output="summary",
+)
+```
+
+Select with exact `topics`, `prefixes`, `regex` or `wildcard`. Entries within a list are ORed; selector kinds are ANDed. At least one selector is required. A bare `prefixes=["/"]` is refused unless another selector narrows it.
+
+Both output modes return `{recording_id, topics, rows, total_rows, truncated}`. `topics` is keyed by topic name:
+- `output="samples"` (default) returns timestamp/value rows.
+- `output="summary"` returns statistics over retained rows, including count and last value.
+
+Window and bound the query with:
+- `start` (inclusive) and `end` (exclusive), using the recording's NT event timestamps.
+- `last_seconds`, relative to the latest NT event timestamp, not wall-clock capture end.
+- `sample_interval`, keeping at most one sample per N seconds per topic.
+- `limit`, retaining at most N events per topic (default 1000, maximum 5000).
+- `max_rows`, retaining at most N events across all topics (default/maximum 5000).
+
+The 60,000-character ceiling applies to samples and summaries. `total_rows` counts matching events before limits and decimation; `rows` reports retained events. If `truncated` is true, the results are a subset. Narrow the selectors or time window before drawing conclusions. See `references/analysis-gotchas.md`.
+
+Omitting the recording ID selects the most recently modified file and returns its resolved ID. Pin that ID for subsequent queries so a newer recording does not change the dataset.
 
 ## 4. Wrap up
 
-1. Summarize the findings, referencing specific time windows or topic values when possible.
-2. Ask the user to confirm or propose next steps (for example, a code fix or a follow-up live test).
+Summarize findings with specific time windows or topic values and propose any follow-up test supported by the evidence.
