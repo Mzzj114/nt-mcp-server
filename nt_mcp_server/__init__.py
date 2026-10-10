@@ -9,6 +9,7 @@ lives in the manager. Run with ``uv run nt-mcp-server`` or
 import asyncio
 import contextlib
 import datetime
+import json
 import os
 import time
 import uuid
@@ -140,6 +141,25 @@ def _topic_selector(
             "regex, or wildcard"
         )
     return selector, None
+
+
+def _closed_recording_id(
+    recording_id: str | None, output_dir: str
+) -> tuple[str | None, str | None]:
+    """Resolve the latest file and reject reads of an active recording."""
+    if recording_id is None:
+        recordings = nt_recorder.list_recordings(output_dir)
+        if not recordings:
+            return None, "no recording found"
+        recording_id = recordings[0]["id"]
+    path = os.path.normcase(os.path.abspath(os.path.join(output_dir, recording_id)))
+    for active_id, recorder in _recorders.items():
+        active_path = os.path.normcase(os.path.abspath(os.path.join(recorder.output_dir, active_id)))
+        if path == active_path and not _recording_tasks[active_id].done():
+            return recording_id, "recording is active; nt_stop_recording closes it before offline queries"
+    if not os.path.isfile(path):
+        return recording_id, f"recording {recording_id!r} not found; nt_list_recordings lists available files"
+    return recording_id, None
 
 
 def _clip_topic_rows(
@@ -772,64 +792,6 @@ def nt_list_recordings(output_dir: str | None = None) -> list[dict]:
 
 @mcp.tool(
     annotations={
-        "title": "Read NetworkTables Topic History",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-def nt_get_history(
-    topic: str,
-    recording_id: str | None = None,
-    start: float | None = None,
-    end: float | None = None,
-    last_seconds: float | None = None,
-    limit: int = 5000,
-    sample_interval: float | None = None,
-    format: str = "samples",
-    output_dir: str | None = None,
-) -> dict:
-    """Return event history for one topic from a recording.
-
-    ``last_seconds`` selects the most recent N seconds of the recording.
-    ``sample_interval`` and ``format="summary"`` behave like live
-    ``nt_subscribe``. At most ``limit`` entries are returned; the response
-    always states ``rows``, ``total_rows`` (all matching events, counted
-    even past the clip) and ``truncated`` so clipping is never silent.
-    A final character ceiling keeps the whole response under 60,000
-    serialized characters; any rows it drops set ``truncated: True``.
-    """
-    dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
-    result = nt_recorder.get_history(
-        topic,
-        recording_id,
-        dir_,
-        start,
-        end,
-        last_seconds,
-        limit,
-        sample_interval,
-        format,
-        return_meta=True,
-    )
-    payload = {
-        "topic": topic,
-        "recording_id": recording_id,
-        "rows": result["rows"],
-        "total_rows": result["total_rows"],
-        "truncated": result["truncated"],
-    }
-    if format == "summary":
-        payload["summary"] = result["summary"]
-    else:
-        payload["samples"] = result["samples"]
-        payload = enforce_max_chars(payload, "samples", _MAX_RESPONSE_CHARS)
-    return payload
-
-
-@mcp.tool(
-    annotations={
         "title": "Inspect NetworkTables Recording",
         "readOnlyHint": True,
         "destructiveHint": False,
@@ -840,36 +802,32 @@ def nt_get_history(
 def nt_get_recording_info(
     recording_id: str | None = None,
     output_dir: str | None = None,
+    prefix: str | None = None,
+    regex: str | None = None,
+    wildcard: str | None = None,
+    topic_limit: int = 100,
 ) -> dict:
-    """Return metadata about a recording.
+    """Return metadata and a bounded, filterable topic list for a recording.
 
     Includes actual capture duration, NT event timestamp span, total sample
     count, topic count, file size and timestamps. Legacy recordings without
     a metadata sidecar explicitly fall back to their event span.
     """
     dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
-    return nt_recorder.get_recording_info(recording_id, dir_)
-
-
-@mcp.tool(
-    annotations={
-        "title": "List Topics in NetworkTables Recording",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    }
-)
-def nt_list_topics_offline(
-    recording_id: str | None = None,
-    prefix: str | None = None,
-    regex: str | None = None,
-    wildcard: str | None = None,
-    output_dir: str | None = None,
-) -> list[str]:
-    """List unique topic names in a recording, optionally filtered."""
-    dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
-    return nt_recorder.list_topics(recording_id, dir_, prefix, regex, wildcard)
+    recording_id, error = _closed_recording_id(recording_id, dir_)
+    if error:
+        return {"recording_id": recording_id, "error": error}
+    try:
+        result = nt_recorder.get_recording_info(
+            recording_id, dir_, prefix, regex, wildcard, topic_limit
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+    while result["topics"] and len(json.dumps(result)) > _MAX_RESPONSE_CHARS:
+        result["topics"].pop()
+        result["topics_returned"] = len(result["topics"])
+        result["topics_truncated"] = True
+    return result
 
 
 @mcp.tool(
@@ -881,7 +839,7 @@ def nt_list_topics_offline(
         "openWorldHint": False,
     }
 )
-def nt_subscribe_offline(
+def nt_query_recording(
     prefixes: list[str] | None = None,
     recording_id: str | None = None,
     start: float | None = None,
@@ -890,7 +848,7 @@ def nt_subscribe_offline(
     limit: int = 1000,
     max_rows: int = 5000,
     sample_interval: float | None = None,
-    format: str = "samples",
+    output: str = "samples",
     output_dir: str | None = None,
     topics: list[str] | None = None,
     regex: str | None = None,
@@ -902,7 +860,7 @@ def nt_subscribe_offline(
     kinds are ANDed. ``regex`` and ``wildcard`` match full topic names.
 
     ``last_seconds`` selects the most recent N seconds. ``sample_interval``
-    decimates per-topic samples, and ``format="summary"`` returns
+    decimates per-topic samples, and ``output="summary"`` returns
     min/max/mean/last per topic. ``limit`` caps entries per topic and
     ``max_rows`` caps the total across topics; the response always states
     ``rows``, ``total_rows`` and ``truncated`` so clipping is never silent.
@@ -936,6 +894,10 @@ def nt_subscribe_offline(
             "truncated": False,
         }
     dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
+    recording_id, error = _closed_recording_id(recording_id, dir_)
+    if error:
+        return {"recording_id": recording_id, "error": error, "topics": {},
+                "rows": 0, "total_rows": 0, "truncated": False}
     result = nt_recorder.subscribe_offline(
         prefixes=prefixes,
         recording_id=recording_id,
@@ -945,19 +907,19 @@ def nt_subscribe_offline(
         last_seconds=last_seconds,
         limit=limit,
         sample_interval=sample_interval,
-        format=format,
+        format=output,
         return_meta=True,
         topics=topics,
         regex=regex,
         wildcard=wildcard,
     )
     topic_payload = (
-        result["topics"] if format != "summary" else result["summary"]
+        result["topics"] if output != "summary" else result["summary"]
     )
     rows = result["rows"]
     total_rows = result["total_rows"]
     truncated = result["truncated"]
-    if format != "summary" and rows > max_rows:
+    if output != "summary" and rows > max_rows:
         # Enforce the total budget truthfully: clip per-topic lists until
         # the sum fits, then recompute rows/truncated from what remains.
         # Summary payloads are one small dict per topic - no row clip.

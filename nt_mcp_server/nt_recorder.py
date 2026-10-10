@@ -570,6 +570,10 @@ def get_history(
 def get_recording_info(
     recording_id: str | None = None,
     output_dir: str = "./recordings",
+    prefix: str | None = None,
+    regex: str | None = None,
+    wildcard: str | None = None,
+    topic_limit: int = 100,
 ) -> dict:
     """Return metadata for a recording.
 
@@ -580,18 +584,27 @@ def get_recording_info(
     ``duration_source="event_span"``. Also includes sample/topic counts and
     ordinary file metadata. Missing files return an ``error`` key.
     """
+    if not 1 <= topic_limit <= 1000:
+        raise ValueError("topic_limit must be between 1 and 1000")
+    selector = TopicSelector([prefix] if prefix is not None else None, regex=regex, wildcard=wildcard)
     path = _resolve_recording(recording_id, output_dir)
     if path is None:
         return {"error": "no recording found"}
-    bounds = _time_bounds(path)
-    event_span = bounds[1] - bounds[0] if bounds else 0.0
+    min_time = None
+    max_time = None
     total = 0
     topics: set[str] = set()
     for event in _iter_events(path):
         total += 1
+        timestamp = event.get("time")
+        if isinstance(timestamp, (int, float)) and timestamp > 0:
+            min_time = timestamp if min_time is None else min(min_time, timestamp)
+            max_time = timestamp if max_time is None else max(max_time, timestamp)
         topic = event.get("topic")
         if isinstance(topic, str):
             topics.add(topic)
+    event_span = max_time - min_time if min_time is not None else 0.0
+    matching_topics = sorted(topic for topic in topics if selector.matches(topic))
     stat = os.stat(path)
     metadata = _read_capture_metadata(path)
     capture_duration = (
@@ -615,6 +628,10 @@ def get_recording_info(
         ),
         "total_samples": total,
         "topic_count": len(topics),
+        "matching_topic_count": len(matching_topics),
+        "topics": matching_topics[:topic_limit],
+        "topics_returned": min(len(matching_topics), topic_limit),
+        "topics_truncated": len(matching_topics) > topic_limit,
     }
     if metadata is not None:
         result.update(

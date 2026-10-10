@@ -50,7 +50,7 @@ async def test_all_tools_publish_safety_annotations() -> None:
     """Every registered tool exposes complete MCP safety annotations."""
     tools = await nt_mcp_server.mcp.list_tools()
 
-    assert len(tools) == 20
+    assert len(tools) == 18
     by_name = {tool.name: tool for tool in tools}
     assert set(by_name) == {
         "nt_connect",
@@ -69,10 +69,8 @@ async def test_all_tools_publish_safety_annotations() -> None:
         "nt_start_recording",
         "nt_stop_recording",
         "nt_list_recordings",
-        "nt_get_history",
         "nt_get_recording_info",
-        "nt_list_topics_offline",
-        "nt_subscribe_offline",
+        "nt_query_recording",
     }
 
     annotation_fields = {
@@ -91,8 +89,8 @@ async def test_all_tools_publish_safety_annotations() -> None:
     assert by_name["nt_get"].annotations.openWorldHint is True
     assert by_name["nt_set"].annotations.readOnlyHint is False
     assert by_name["nt_set"].annotations.destructiveHint is True
-    assert by_name["nt_get_history"].annotations.readOnlyHint is True
-    assert by_name["nt_get_history"].annotations.openWorldHint is False
+    assert by_name["nt_query_recording"].annotations.readOnlyHint is True
+    assert by_name["nt_query_recording"].annotations.openWorldHint is False
 
 
 async def wait_until(
@@ -721,8 +719,8 @@ async def test_nt_list_recordings_returns_metadata(
 
 
 @pytest.mark.anyio
-async def test_nt_get_history_returns_events(mcp_synced: None, tmp_path) -> None:
-    """Given a recording, nt_get_history returns bounded samples with meta."""
+async def test_nt_query_single_topic_returns_events(mcp_synced: None, tmp_path) -> None:
+    """Given a recording, nt_query_single_topic returns bounded samples with meta."""
     recorder = nt_recorder.Recorder(
         nt_mcp_server.manager,
         output_dir=str(tmp_path),
@@ -730,15 +728,15 @@ async def test_nt_get_history_returns_events(mcp_synced: None, tmp_path) -> None
         duration=1.0,
     )
     await recorder.run()
-    result = nt_mcp_server.nt_get_history(
-        "/SmartDashboard/test_num", output_dir=str(tmp_path)
+    result = nt_mcp_server.nt_query_recording(
+        topics=["/SmartDashboard/test_num"], output_dir=str(tmp_path)
     )
     assert isinstance(result, dict)
-    assert result["topic"] == "/SmartDashboard/test_num"
+    assert set(result["topics"]) == {"/SmartDashboard/test_num"}
     assert result["rows"] >= 1
     assert result["total_rows"] >= result["rows"]
     assert result["truncated"] is False
-    samples = result["samples"]
+    samples = result["topics"]["/SmartDashboard/test_num"]
     assert isinstance(samples, list)
     assert len(samples) == result["rows"]
     for entry in samples:
@@ -749,8 +747,8 @@ async def test_nt_get_history_returns_events(mcp_synced: None, tmp_path) -> None
 
 
 @pytest.mark.anyio
-async def test_nt_get_history_summary(mcp_synced: None, tmp_path) -> None:
-    """Given a recording, nt_get_history with format=summary returns stats."""
+async def test_nt_query_single_topic_summary(mcp_synced: None, tmp_path) -> None:
+    """Given a recording, nt_query_single_topic with format=summary returns stats."""
     recorder = nt_recorder.Recorder(
         nt_mcp_server.manager,
         output_dir=str(tmp_path),
@@ -758,12 +756,12 @@ async def test_nt_get_history_summary(mcp_synced: None, tmp_path) -> None:
         duration=1.0,
     )
     await recorder.run()
-    result = nt_mcp_server.nt_get_history(
-        "/SmartDashboard/test_num", output_dir=str(tmp_path), format="summary"
+    result = nt_mcp_server.nt_query_recording(
+        topics=["/SmartDashboard/test_num"], output_dir=str(tmp_path), output="summary"
     )
     assert isinstance(result, dict)
     assert result["truncated"] is False
-    summary = result["summary"]
+    summary = result["topics"]["/SmartDashboard/test_num"]
     assert summary["count"] >= 1
     assert summary["last_value"] == 42.0
     assert "min" in summary
@@ -791,10 +789,10 @@ async def test_nt_get_recording_info(mcp_synced: None, tmp_path) -> None:
 
 
 @pytest.mark.anyio
-async def test_nt_list_topics_offline_returns_topics(
+async def test_nt_get_recording_info_returns_topics(
     mcp_synced: None, tmp_path
 ) -> None:
-    """Given a recording, nt_list_topics_offline returns topics; prefix narrows."""
+    """Given a recording, nt_get_recording_info returns topics; prefix narrows."""
     recorder = nt_recorder.Recorder(
         nt_mcp_server.manager,
         output_dir=str(tmp_path),
@@ -802,21 +800,21 @@ async def test_nt_list_topics_offline_returns_topics(
         duration=1.0,
     )
     await recorder.run()
-    all_topics = nt_mcp_server.nt_list_topics_offline(output_dir=str(tmp_path))
+    all_topics = nt_mcp_server.nt_get_recording_info(output_dir=str(tmp_path))["topics"]
     assert set(FIXTURE_NAMES) <= set(all_topics)
-    prefixed = nt_mcp_server.nt_list_topics_offline(
+    prefixed = nt_mcp_server.nt_get_recording_info(
         output_dir=str(tmp_path), prefix="/SmartDashboard/"
-    )
+    )["topics"]
     assert all(topic.startswith("/SmartDashboard/") for topic in prefixed)
     assert set(FIXTURE_NAMES) <= set(prefixed)
     json.dumps(prefixed)
 
 
 @pytest.mark.anyio
-async def test_nt_subscribe_offline_returns_dict(
+async def test_nt_query_recording_returns_dict(
     mcp_synced: None, tmp_path
 ) -> None:
-    """Given a recording, nt_subscribe_offline buckets events by topic."""
+    """Given a recording, nt_query_recording buckets events by topic."""
     recorder = nt_recorder.Recorder(
         nt_mcp_server.manager,
         output_dir=str(tmp_path),
@@ -824,11 +822,11 @@ async def test_nt_subscribe_offline_returns_dict(
         duration=1.0,
     )
     await recorder.run()
-    result = nt_mcp_server.nt_subscribe_offline(
+    result = nt_mcp_server.nt_query_recording(
         ["/SmartDashboard/"], output_dir=str(tmp_path)
     )
     assert isinstance(result, dict)
-    assert result["recording_id"] is None  # defaults to most recent
+    assert result["recording_id"].endswith(".ndjson")  # resolves most recent
     assert result["rows"] >= 1
     assert result["total_rows"] >= result["rows"]
     assert result["truncated"] is False
@@ -839,7 +837,7 @@ async def test_nt_subscribe_offline_returns_dict(
         for entry in topics[name]:
             assert sorted(entry) == ["time", "value"]
             assert isinstance(entry["time"], float)
-    empty = nt_mcp_server.nt_subscribe_offline(
+    empty = nt_mcp_server.nt_query_recording(
         ["/does/not/exist/"], output_dir=str(tmp_path)
     )
     assert empty["rows"] == 0
@@ -850,7 +848,7 @@ async def test_nt_subscribe_offline_returns_dict(
 
 
 @pytest.mark.anyio
-async def test_nt_subscribe_offline_summary(
+async def test_nt_query_recording_summary(
     mcp_synced: None, tmp_path
 ) -> None:
     """subscribe_offline with format=summary returns per-topic summaries."""
@@ -861,8 +859,8 @@ async def test_nt_subscribe_offline_summary(
         duration=1.0,
     )
     await recorder.run()
-    result = nt_mcp_server.nt_subscribe_offline(
-        ["/SmartDashboard/"], output_dir=str(tmp_path), format="summary"
+    result = nt_mcp_server.nt_query_recording(
+        ["/SmartDashboard/"], output_dir=str(tmp_path), output="summary"
     )
     assert isinstance(result, dict)
     assert result["truncated"] is False
@@ -873,7 +871,7 @@ async def test_nt_subscribe_offline_summary(
 
 
 @pytest.mark.anyio
-async def test_nt_subscribe_offline_rich_topic_selectors(
+async def test_nt_query_recording_rich_topic_selectors(
     mcp_synced: None, tmp_path
 ) -> None:
     """Offline reads accept exact topics, regex, and wildcard filters."""
@@ -885,12 +883,12 @@ async def test_nt_subscribe_offline_rich_topic_selectors(
     )
     await recorder.run()
 
-    exact = nt_mcp_server.nt_subscribe_offline(
+    exact = nt_mcp_server.nt_query_recording(
         topics=["/SmartDashboard/test_num"], output_dir=str(tmp_path)
     )
     assert set(exact["topics"]) == {"/SmartDashboard/test_num"}
 
-    regex = nt_mcp_server.nt_subscribe_offline(
+    regex = nt_mcp_server.nt_query_recording(
         regex=r"test_(num|str)$", output_dir=str(tmp_path)
     )
     assert set(regex["topics"]) == {
@@ -898,26 +896,26 @@ async def test_nt_subscribe_offline_rich_topic_selectors(
         "/SmartDashboard/test_str",
     }
 
-    wildcard = nt_mcp_server.nt_subscribe_offline(
+    wildcard = nt_mcp_server.nt_query_recording(
         wildcard="/SmartDashboard/test_arr", output_dir=str(tmp_path)
     )
     assert set(wildcard["topics"]) == {"/SmartDashboard/test_arr"}
 
 
-def test_nt_get_history_missing_recording_returns_empty() -> None:
-    """Given a missing recording_id, nt_get_history returns empty samples."""
-    result = nt_mcp_server.nt_get_history(
-        "/x", recording_id="nonexistent.ndjson", output_dir="."
+def test_nt_query_single_topic_missing_recording_returns_empty() -> None:
+    """Given a missing recording_id, nt_query_single_topic returns empty samples."""
+    result = nt_mcp_server.nt_query_recording(
+        topics=["/x"], recording_id="nonexistent.ndjson", output_dir="."
     )
     assert result["rows"] == 0
     assert result["total_rows"] == 0
     assert result["truncated"] is False
-    assert result["samples"] == []
+    assert result["topics"] == {}
     json.dumps(result)
 
 
 @pytest.mark.anyio
-async def test_nt_subscribe_offline_rejects_bare_root_prefix(
+async def test_nt_query_recording_rejects_bare_root_prefix(
     mcp_synced: None, tmp_path
 ) -> None:
     """A bare '/' prefix is refused with an actionable structured error."""
@@ -928,7 +926,7 @@ async def test_nt_subscribe_offline_rejects_bare_root_prefix(
         duration=1.0,
     )
     await recorder.run()
-    result = nt_mcp_server.nt_subscribe_offline(["/"], output_dir=str(tmp_path))
+    result = nt_mcp_server.nt_query_recording(["/"], output_dir=str(tmp_path))
     assert "error" in result
     assert "/" in result["error"]
     assert "nt-recorder" in result["error"]
@@ -938,7 +936,7 @@ async def test_nt_subscribe_offline_rejects_bare_root_prefix(
 
 
 @pytest.mark.anyio
-async def test_nt_get_history_reports_truncation(
+async def test_nt_query_single_topic_reports_truncation(
     mcp_synced: None, tmp_path
 ) -> None:
     """limit below the match count sets truncated with a true total_rows."""
@@ -958,17 +956,17 @@ async def test_nt_get_history_reports_truncation(
     )
     await recorder.run()
     await churn_task
-    result = nt_mcp_server.nt_get_history(
-        topic, output_dir=str(tmp_path), limit=3
+    result = nt_mcp_server.nt_query_recording(
+        topics=[topic], output_dir=str(tmp_path), limit=3
     )
     assert result["rows"] == 3
     assert result["total_rows"] > 3
     assert result["truncated"] is True
-    assert len(result["samples"]) == 3
+    assert len(result["topics"][topic]) == 3
 
 
 @pytest.mark.anyio
-async def test_nt_subscribe_offline_max_rows_enforces_budget(
+async def test_nt_query_recording_max_rows_enforces_budget(
     mcp_synced: None, tmp_path
 ) -> None:
     """max_rows clips the total across topics and flags truncated."""
@@ -979,7 +977,7 @@ async def test_nt_subscribe_offline_max_rows_enforces_budget(
         duration=1.0,
     )
     await recorder.run()
-    result = nt_mcp_server.nt_subscribe_offline(
+    result = nt_mcp_server.nt_query_recording(
         ["/SmartDashboard/"], output_dir=str(tmp_path), max_rows=2
     )
     assert result["rows"] <= 2
@@ -987,6 +985,44 @@ async def test_nt_subscribe_offline_max_rows_enforces_budget(
     assert result["truncated"] is True
     assert sum(len(v) for v in result["topics"].values()) == result["rows"]
     assert len(json.dumps(result)) < 60_000
+
+
+def test_recording_info_filters_and_bounds_topics(tmp_path) -> None:
+    """Topic filters affect discovery counts, while metadata describes the whole file."""
+    recording = tmp_path / "filters.ndjson"
+    events = [{"time": float(i + 1), "topic": name, "value": i}
+              for i, name in enumerate(["/drive/a", "/drive/b", "/arm/a"])]
+    recording.write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
+    info = nt_mcp_server.nt_get_recording_info(
+        output_dir=str(tmp_path), prefix="/drive/", regex=r"[ab]$",
+        wildcard="*/?", topic_limit=1,
+    )
+    assert info["total_samples"] == 3
+    assert info["topic_count"] == 3
+    assert info["matching_topic_count"] == 2
+    assert info["topics"] == ["/drive/a"]
+    assert info["topics_returned"] == 1
+    assert info["topics_truncated"] is True
+    empty = nt_mcp_server.nt_get_recording_info(output_dir=str(tmp_path), prefix="/none/")
+    assert empty["topics"] == []
+    assert empty["topics_truncated"] is False
+    invalid = nt_mcp_server.nt_get_recording_info(output_dir=str(tmp_path), regex="[")
+    assert "invalid topic regex" in invalid["error"]
+
+
+@pytest.mark.anyio
+async def test_offline_tools_reject_active_recording(mcp_synced: None, tmp_path) -> None:
+    start = await nt_mcp_server.nt_start_recording(topics=[FIXTURE_NAMES[0]], output_dir=str(tmp_path))
+    try:
+        info = nt_mcp_server.nt_get_recording_info(output_dir=str(tmp_path))
+        query = nt_mcp_server.nt_query_recording(topics=[FIXTURE_NAMES[0]], output_dir=str(tmp_path))
+        assert "recording is active" in info["error"]
+        assert "recording is active" in query["error"]
+    finally:
+        await nt_mcp_server.nt_stop_recording(start["recording_id"])
+    query = nt_mcp_server.nt_query_recording(topics=[FIXTURE_NAMES[0]], output_dir=str(tmp_path))
+    assert query["recording_id"] == start["recording_id"]
+    assert "error" not in query
 
 
 # --- Character-ceiling guard (nt_types.enforce_max_chars) --------------------
@@ -1082,7 +1118,7 @@ def test_enforce_max_chars_forces_truncated_without_rows_key() -> None:
     assert len(json.dumps(result)) <= 200
 
 
-def test_nt_subscribe_offline_char_ceiling_worst_case(tmp_path) -> None:
+def test_nt_query_recording_char_ceiling_worst_case(tmp_path) -> None:
     """Worst case: 5000 dense rows would far exceed 60,000 chars.
 
     10 topics x 700 events = 7000 matches; the max_rows=5000 row budget
@@ -1100,7 +1136,7 @@ def test_nt_subscribe_offline_char_ceiling_worst_case(tmp_path) -> None:
                     )
                     + "\n"
                 )
-    result = nt_mcp_server.nt_subscribe_offline(
+    result = nt_mcp_server.nt_query_recording(
         ["/SmartDashboard/"], recording_id="dense.ndjson", output_dir=str(tmp_path)
     )
     dumped = json.dumps(result)
@@ -1112,8 +1148,8 @@ def test_nt_subscribe_offline_char_ceiling_worst_case(tmp_path) -> None:
     assert result["total_rows"] == 7000
 
 
-def test_nt_get_history_char_ceiling_worst_case(tmp_path) -> None:
-    """nt_get_history holds the same ceiling on a dense single-topic file."""
+def test_nt_query_single_topic_char_ceiling_worst_case(tmp_path) -> None:
+    """nt_query_single_topic holds the same ceiling on a dense single-topic file."""
     recording = tmp_path / "single_dense.ndjson"
     with open(recording, "w", encoding="utf-8") as file:
         for i in range(6000):
@@ -1127,15 +1163,15 @@ def test_nt_get_history_char_ceiling_worst_case(tmp_path) -> None:
                 )
                 + "\n"
             )
-    result = nt_mcp_server.nt_get_history(
-        "/SmartDashboard/dense",
+    result = nt_mcp_server.nt_query_recording(
+        topics=["/SmartDashboard/dense"],
         recording_id="single_dense.ndjson",
         output_dir=str(tmp_path),
     )
     dumped = json.dumps(result)
     assert len(dumped) <= 60_000
     assert result["truncated"] is True
-    assert result["rows"] == len(result["samples"])
+    assert result["rows"] == len(result["topics"]["/SmartDashboard/dense"])
     assert result["rows"] < 5000  # char guard dropped rows the limit kept
     assert result["total_rows"] == 6000
 
@@ -1246,7 +1282,7 @@ async def test_budget_bare_root_summary_returns_structured_error(
 async def test_budget_subscribe_offline_max_rows_truncates(
     mcp_synced: None, tmp_path
 ) -> None:
-    """(d) nt_subscribe_offline(max_rows=10) sets truncated on a dense read.
+    """(d) nt_query_recording(max_rows=10) sets truncated on a dense read.
 
     Given a recording with more matching events than the budget, When the
     offline tool reads with max_rows=10, Then truncated is True, the
@@ -1271,7 +1307,7 @@ async def test_budget_subscribe_offline_max_rows_truncates(
     await churn_task
     assert recorder.rows > 10, "fixture must produce more than 10 events"
 
-    result = nt_mcp_server.nt_subscribe_offline(
+    result = nt_mcp_server.nt_query_recording(
         ["/SmartDashboard/"], output_dir=str(tmp_path), max_rows=10
     )
     assert result["truncated"] is True
@@ -1283,13 +1319,13 @@ async def test_budget_subscribe_offline_max_rows_truncates(
 
 
 @pytest.mark.anyio
-async def test_budget_get_history_limit_reports_true_total(
+async def test_budget_query_single_topic_limit_reports_true_total(
     mcp_synced: None, tmp_path
 ) -> None:
-    """(e) nt_get_history(limit=2) reports truncated truthfully.
+    """(e) nt_query_single_topic(limit=2) reports truncated truthfully.
 
     Given a fixture recording whose topic holds exactly ``recorded``
-    events, When nt_get_history reads with limit=2, Then rows == 2,
+    events, When nt_query_single_topic reads with limit=2, Then rows == 2,
     truncated is True iff the true count exceeds 2, and total_rows equals
     the real number of events in the recording.
     """
@@ -1319,13 +1355,13 @@ async def test_budget_get_history_limit_reports_true_total(
         )
     assert topic_events >= recorded
 
-    result = nt_mcp_server.nt_get_history(
-        topic, output_dir=str(tmp_path), limit=2
+    result = nt_mcp_server.nt_query_recording(
+        topics=[topic], output_dir=str(tmp_path), limit=2
     )
     assert result["rows"] == 2
     assert result["total_rows"] == topic_events
     assert result["truncated"] is (topic_events > 2)
-    assert len(result["samples"]) == 2
+    assert len(result["topics"][topic]) == 2
 
 
 @pytest.mark.anyio
