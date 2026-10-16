@@ -396,9 +396,14 @@ async def test_nt_recording_writes_file_receipt(mcp_synced: None, tmp_path) -> N
     assert response["path"] == str(tmp_path / response["recording_id"])
     assert response["rows"] >= len(FIXTURE_NAMES)
     assert response["topic_count"] >= len(FIXTURE_NAMES)
+    info = nt_mcp_server.nt_get_recording_info(
+        recording_id=response["recording_id"], output_dir=str(tmp_path)
+    )
     for name in FIXTURE_NAMES:
-        assert name in response["topics"], f"missing topic {name}"
-    assert response["topics_truncated"] is False
+        assert name in info["topics"], f"missing recorded topic {name}"
+    assert response["topic_count"] == info["topic_count"]
+    assert response["topics"] == info["topics"][:5]
+    assert response["topics_truncated"] == (response["topic_count"] > 5)
     assert response["truncated"] is False
     assert "samples" not in response, "receipt must not contain sample values"
     assert len(json.dumps(response)) < 20_000
@@ -1338,6 +1343,46 @@ async def test_budget_recording_receipt_is_bounded(mcp_synced: None, tmp_path) -
     assert "samples" not in response
     receipt = json.dumps(response)
     assert len(receipt) < 20_000, f"receipt serialized to {len(receipt)} chars"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("name_length, preview_count", [(0, 5), (150, 2), (1000, 0)])
+async def test_recording_receipt_topic_preview_preserves_full_discovery(
+    mcp_synced: None, nt_server, tmp_path, name_length, preview_count
+) -> None:
+    """Short receipts must preserve full capture counts and offline discovery."""
+    topics = [
+        f"/ReceiptPreview/{name_length}/{i:02d}/" + "x" * name_length
+        for i in range(12)
+    ]
+    publishers = [nt_server.getStringTopic(topic).publish() for topic in topics]
+    try:
+        for publisher in publishers:
+            publisher.set("sample values must stay out of receipts")
+        nt_server.flush()
+        start = await nt_mcp_server.nt_start_recording(
+            topics=topics, output_dir=str(tmp_path)
+        )
+        await asyncio.sleep(0.5)
+        receipt = await nt_mcp_server.nt_stop_recording(start["recording_id"])
+        assert receipt["stopped"] is True
+        assert receipt["rows"] >= len(topics)
+        assert receipt["topic_count"] == len(topics)
+        assert receipt["topics"] == topics[:preview_count]
+        assert len(json.dumps(receipt["topics"])) <= 500
+        assert receipt["topics_truncated"] is True
+        assert receipt["truncated"] is False
+        assert "sample values must stay out of receipts" not in json.dumps(receipt)
+        info = nt_mcp_server.nt_get_recording_info(
+            recording_id=receipt["recording_id"], output_dir=str(tmp_path),
+            prefix=f"/ReceiptPreview/{name_length}/",
+        )
+        assert info["topics"] == topics
+        assert info["topics_truncated"] is False
+        assert info["topic_count"] == len(topics)
+    finally:
+        for publisher in publishers:
+            publisher.close()
 
 
 @pytest.mark.anyio

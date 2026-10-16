@@ -32,8 +32,9 @@ _CONNECT_POLL_INTERVAL_SECONDS = 0.05
 # no matter what the row budgets allowed. See nt_types.enforce_max_chars.
 _MAX_RESPONSE_CHARS = 60_000
 
-# The file-mode receipt lists at most this many topic names.
-_MAX_RECEIPT_TOPICS = 50
+# Bound both the number and serialized size of topic names in file receipts.
+_MAX_RECEIPT_TOPICS = 5
+_MAX_RECEIPT_TOPIC_CHARS = 500
 
 # Shared parameter contracts are included in the MCP input schemas.
 TopicName = Annotated[
@@ -264,6 +265,11 @@ def _recording_receipt(
 ) -> dict:
     """Build the compact, value-free receipt shared by recording tools."""
     topics = recorder.topics
+    topic_preview: list[str] = []
+    for topic in topics[:_MAX_RECEIPT_TOPICS]:
+        if len(json.dumps(topic_preview + [topic])) > _MAX_RECEIPT_TOPIC_CHARS:
+            break
+        topic_preview.append(topic)
     return {
         "output": "file",
         "recording_id": os.path.basename(path),
@@ -277,8 +283,8 @@ def _recording_receipt(
         "event_span_seconds": recorder.event_span_seconds,
         "rows": recorder.rows,
         "topic_count": len(topics),
-        "topics": topics[:_MAX_RECEIPT_TOPICS],
-        "topics_truncated": len(topics) > _MAX_RECEIPT_TOPICS,
+        "topics": topic_preview,
+        "topics_truncated": len(topics) > len(topic_preview),
         "truncated": recorder.truncated,
     }
 
@@ -925,7 +931,14 @@ async def nt_start_recording(
     }
 )
 async def nt_stop_recording(recording_id: RecordingId) -> dict:
-    """Stop a nonblocking recording and return its compact file receipt."""
+    """Stop a nonblocking recording and return its compact file receipt.
+
+    Timing and counts describe the full capture. ``topics`` previews at most
+    five names within 500 serialized characters; ``topics_truncated`` marks
+    omitted names, independently of the captured-row ``truncated`` flag.
+    Use ``nt_get_recording_info`` with this ``recording_id`` and optional
+    topic filters for bounded discovery of the recorded topics.
+    """
     recorder = _recorders.get(recording_id)
     task = _recording_tasks.get(recording_id)
     if recorder is None or task is None:
