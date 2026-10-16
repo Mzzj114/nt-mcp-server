@@ -1,5 +1,7 @@
 # nt-mcp-server
 
+[![Listed on mcpservers.org](https://mcpservers.org/badge.svg)](https://mcpservers.org/servers/mzzj114/nt-mcp-server)
+
 > ### What is a MCP?
 > 
 > **The Model Context Protocol (MCP)** is a standard way for AI agents to use external tools and data. The concept is established by Anthropic researchers in the end of 2024.

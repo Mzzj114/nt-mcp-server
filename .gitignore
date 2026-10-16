@@ -12,7 +12,7 @@ tools/.*.txt
 recordings/
 opencode.jsonc
 
-note.txt
+usage_records/
 
 build/
 dist/
