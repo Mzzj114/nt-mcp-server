@@ -130,7 +130,7 @@ SampleInterval = Annotated[
     Field(
         gt=0,
         allow_inf_nan=False,
-        description="Minimum seconds between retained events per topic; omitted keeps every event.",
+        description="Minimum NT timestamp spacing between retained events per topic; filters received events before row limits, without generating periodic readings. Omitted disables interval filtering.",
     ),
 ]
 ChangeThreshold = Annotated[
@@ -144,7 +144,7 @@ ChangeThreshold = Annotated[
 OutputMode = Annotated[
     Literal["summary", "samples"],
     Field(
-        description="summary returns statistics over retained rows; samples returns timestamp/value rows."
+        description="summary returns statistics over rows retained after filters and output limits; last_value is the last retained event, not necessarily the value at the end of the window. samples returns timestamp/value rows."
     ),
 ]
 RowLimit = Annotated[
@@ -639,9 +639,17 @@ async def nt_sample(
 ) -> dict:
     """Sample selected live updates for a fixed window and return bounded results.
 
+    Receives available initial values followed by incoming value updates;
+    it does not periodically read unchanged values. A quiet topic may have
+    only one sample. Initial NT timestamps can predate this sampling window.
+    ``sample_interval`` filters received events before row limits; it does
+    not set a polling rate or create samples.
+
     Returns ``samples`` keyed by topic, ``rows``, ``total_rows`` and
     ``truncated``. Summary mode returns statistics over retained samples;
-    samples mode returns timestamp/value rows. Selectors are ANDed across
+    ``last_value`` is the last event retained after filters and output
+    limits, which may precede the end of the window. Samples mode returns
+    timestamp/value rows. Selectors are ANDed across
     kinds and ORed within lists. A bare "/" prefix is refused.
     ``nt_start_recording`` captures a human-controlled window to a file;
     ``nt_start_subscription`` buffers updates for later polling.
@@ -851,6 +859,9 @@ async def nt_start_recording(
     Use ``nt_stop_recording(recording_id)`` after the human-controlled test
     window. The stop call closes the file and returns the compact receipt;
     do not use offline readers before it reports ``stopped: true``.
+    Records the same initial values and incoming updates as ``nt_sample``;
+    it does not periodically read unchanged values. ``sample_interval``
+    filters received events rather than generating periodic readings.
     Selector kinds are ANDed; list entries ORed. ``nt_sample`` returns a
     fixed window inline; ``nt_start_subscription`` buffers events for polling.
     """
@@ -1044,8 +1055,11 @@ def nt_query_recording(
     kinds are ANDed. ``regex`` and ``wildcard`` match full topic names.
 
     ``last_seconds`` selects the most recent N seconds. ``sample_interval``
-    decimates per-topic samples, and ``output="summary"`` returns
-    min/max/mean/last per topic. ``limit`` caps entries per topic and
+    decimates per-topic events before row limits; it does not generate
+    regularly spaced samples. ``output="summary"`` returns min/max/mean/last
+    over rows retained after filtering and output limits. ``last_value``
+    is the last retained event, which may precede the end of the selected
+    window. ``limit`` caps entries per topic and
     ``max_rows`` caps the total across topics; the response always states
     ``rows``, ``total_rows`` and ``truncated`` so clipping is never silent.
     A bare ``"/"`` prefix is refused; ``nt_get_recording_info`` discovers
