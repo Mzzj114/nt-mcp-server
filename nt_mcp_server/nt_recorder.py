@@ -346,21 +346,6 @@ def _matches_filters(
     return True
 
 
-def _downsample(events: list[dict], sample_interval: float) -> list[dict]:
-    """Keep at most one event per ``sample_interval`` seconds."""
-    if sample_interval is None or sample_interval <= 0:
-        return events
-    last_time: dict[str, float] = {}
-    out: list[dict] = []
-    for event in events:
-        topic = event.get("topic", "")
-        t = event["time"]
-        if t - last_time.get(topic, -sample_interval) >= sample_interval:
-            last_time[topic] = t
-            out.append(event)
-    return out
-
-
 def _iso_timestamp(unix_time: float | None) -> str | None:
     """Return a UTC ISO-8601 string for a Unix timestamp."""
     if unix_time is None:
@@ -519,7 +504,8 @@ def get_history(
     Each entry is ``{"time": float, "value": jsonable}`` — same shape as
     live ``nt_subscribe`` entries. ``start`` is inclusive (``time >= start``);
     ``end`` is exclusive (``time < end``). ``last_seconds`` selects the most
-    recent N seconds. ``sample_interval`` decimates the samples, and
+    recent N seconds. ``sample_interval`` decimates before ``limit`` caps
+    the retained samples, and
     ``format="summary"`` returns min/max/mean/last.
 
     Missing file returns ``[]``. Malformed lines are skipped with a warning
@@ -537,6 +523,9 @@ def get_history(
     start, end = _apply_time_filter(path, start, end, last_seconds)
     events: list[dict] = []
     total_rows = 0
+    decimator = StreamDecimator(
+        sample_interval=sample_interval if sample_interval and sample_interval > 0 else None
+    )
     for t, event in _iter_timed_events(path):
         if event.get("topic") != topic:
             continue
@@ -545,11 +534,11 @@ def get_history(
         if end is not None and t >= end:
             continue
         total_rows += 1
+        if not decimator.keep(topic, event.get("value"), t):
+            continue
         if limit is not None and len(events) >= limit:
             continue
         events.append({"time": t, "value": event.get("value")})
-    if sample_interval is not None:
-        events = _downsample(events, sample_interval)
     rows = len(events)
     if format == "summary":
         events = summarize(events)
@@ -666,7 +655,8 @@ def subscribe_offline(
     kinds are ANDed. At least one selector kind is required.
     ``start`` is inclusive, ``end`` is exclusive. ``last_seconds`` selects
     the most recent N seconds. If ``limit`` is given, it is applied per-topic
-    (each topic gets at most ``limit`` entries). ``sample_interval`` and
+    after decimation (each topic gets at most ``limit`` retained entries).
+    ``sample_interval`` and
     ``format="summary"`` behave like live ``nt_subscribe``. Missing file
     returns ``{}``. Malformed lines are skipped with a warning to stderr.
 
@@ -687,6 +677,9 @@ def subscribe_offline(
     start, end = _apply_time_filter(path, start, end, last_seconds)
     out: dict[str, list[dict]] = {}
     total_rows = 0
+    decimator = StreamDecimator(
+        sample_interval=sample_interval if sample_interval and sample_interval > 0 else None
+    )
     for t, event in _iter_timed_events(path):
         topic = event.get("topic")
         if not isinstance(topic, str):
@@ -698,14 +691,11 @@ def subscribe_offline(
         if end is not None and t >= end:
             continue
         total_rows += 1
+        if not decimator.keep(topic, event.get("value"), t):
+            continue
         if limit is not None and len(out.get(topic, ())) >= limit:
             continue
         out.setdefault(topic, []).append({"time": t, "value": event.get("value")})
-    if sample_interval is not None:
-        out = {
-            topic: _downsample(samples, sample_interval)
-            for topic, samples in out.items()
-        }
     rows = sum(len(samples) for samples in out.values())
     if format == "summary":
         out = {topic: summarize(samples) for topic, samples in out.items()}

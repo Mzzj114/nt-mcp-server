@@ -443,6 +443,53 @@ def test_reader_get_history_return_meta_not_truncated(tmp_path) -> None:
     assert result["truncated"] is False
 
 
+@pytest.mark.parametrize("reader", ["history", "subscribe"])
+@pytest.mark.parametrize("output", ["samples", "summary"])
+@pytest.mark.parametrize("limit", [3, None])
+def test_reader_decimates_before_limit(tmp_path, reader, output, limit) -> None:
+    """Dense early events must not exhaust the retained-row budget."""
+    topics = ["/test/a"] if reader == "history" else ["/test/a", "/test/b"]
+    path = tmp_path / "dense.ndjson"
+    with path.open("w", encoding="utf-8") as file:
+        for i in range(31):
+            for index, topic in enumerate(topics):
+                file.write(json.dumps({
+                    "time": 1000.0 + i / 10 + index / 4,
+                    "topic": topic,
+                    "value": i,
+                }) + "\n")
+    kwargs = dict(
+        recording_id=path.name,
+        output_dir=str(tmp_path),
+        sample_interval=1.0,
+        limit=limit,
+        format=output,
+        return_meta=True,
+    )
+    if reader == "history":
+        result = nt_recorder.get_history(topics[0], **kwargs)
+        retained = {topics[0]: result["summary" if output == "summary" else "samples"]}
+    else:
+        result = nt_recorder.subscribe_offline(topics=topics, **kwargs)
+        retained = result["summary" if output == "summary" else "topics"]
+    values = [0, 10, 20] if limit == 3 else [0, 10, 20, 30]
+    assert result["rows"] == len(values) * len(topics)
+    assert result["total_rows"] == 31 * len(topics)
+    assert result["truncated"] is True
+    for index, topic in enumerate(topics):
+        if output == "samples":
+            assert retained[topic] == [
+                {"time": 1000.0 + value / 10 + index / 4, "value": value}
+                for value in values
+            ]
+        else:
+            assert retained[topic]["count"] == len(values)
+            assert retained[topic]["last_value"] == values[-1]
+            assert retained[topic]["min"] == 0
+            assert retained[topic]["max"] == values[-1]
+            assert retained[topic]["mean"] == sum(values) / len(values)
+
+
 def test_reader_get_history_return_meta_summary(tmp_path) -> None:
     """return_meta with format=summary nests the summary under 'summary'."""
     recording_id = _write_synthetic_recording(
