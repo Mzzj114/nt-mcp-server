@@ -106,6 +106,9 @@ async def test_mcp_schemas_describe_and_validate_parameters() -> None:
         assert "output_dir" not in sample
         assert sample["duration"]["exclusiveMinimum"] == 0
         assert sample["duration"]["maximum"] == 60
+        read = tools["nt_read_topics"].inputSchema["properties"]
+        assert read["include_metadata"]["type"] == "boolean"
+        assert read["include_metadata"]["default"] is False
         for name, arguments in [
             ("nt_sample", {"topics": [FIXTURE_NAMES[0]], "output": "file"}),
             ("nt_sample", {"topics": [FIXTURE_NAMES[0]], "duration": 0}),
@@ -253,9 +256,56 @@ async def test_nt_connection_info_is_json_serializable(mcp_synced: None) -> None
 async def test_nt_read_topics_single_topic(mcp_synced: None) -> None:
     """A one-topic read returns its value under the same map as batch reads."""
     response = await nt_mcp_server.nt_read_topics(["/SmartDashboard/test_num"])
+    assert set(response) == {"connected", "values"}
+    assert response == await nt_mcp_server.nt_read_topics(
+        ["/SmartDashboard/test_num"], include_metadata=False
+    )
     assert response["connected"] is True
     assert response["values"]["/SmartDashboard/test_num"] == 42.0
     assert type(response["values"]["/SmartDashboard/test_num"]) is float
+
+
+@pytest.mark.anyio
+async def test_nt_read_topics_metadata_over_mcp(mcp_synced: None) -> None:
+    """A single-topic opt-in works over MCP and keeps the original values map."""
+    topic = "/SmartDashboard/test_num"
+    async with Client(nt_mcp_server.mcp) as client:
+        result = await client.call_tool_mcp(
+            "nt_read_topics", {"topics": [topic], "include_metadata": True}
+        )
+    assert result.isError is False
+    response = result.structuredContent
+    assert response["connected"] is True
+    assert response["values"] == {topic: 42.0}
+    metadata = response["metadata"][topic]
+    assert metadata["type"] == "double"
+    assert metadata["valid"] is True
+    assert type(metadata["local_time_us"]) is int
+    assert type(metadata["server_time_us"]) is int
+    json.dumps(response)
+
+
+@pytest.mark.anyio
+async def test_nt_read_topics_metadata_batch(mcp_synced: None) -> None:
+    """Each requested topic is represented, including missing values."""
+    missing = "/SmartDashboard/metadata_missing"
+    topics = FIXTURE_NAMES + [missing]
+    response = await nt_mcp_server.nt_read_topics(topics, include_metadata=True)
+    assert response["connected"] is True
+    assert set(response["values"]) == set(response["metadata"]) == set(topics)
+    assert response["values"] == {
+        **{name: value for name, _, value in FIXTURE_TOPICS}, missing: None,
+    }
+    for topic, expected_type in zip(FIXTURE_NAMES, ["double", "string", "boolean", "int[]"]):
+        metadata = response["metadata"][topic]
+        assert metadata["valid"] is True
+        assert metadata["type"] == expected_type
+        assert metadata["local_time_us"] > 0
+        assert metadata["server_time_us"] > 1
+    assert response["metadata"][missing] == {
+        "type": None, "valid": False,
+        "local_time_us": None, "server_time_us": None,
+    }
 
 
 @pytest.mark.anyio
@@ -586,6 +636,10 @@ async def test_nt_disconnect_returns_status_and_reconnects(mcp_synced: None) -> 
     )
 
     # After disconnect, read tools report the disconnected state clearly.
+    for include_metadata in (False, True):
+        assert await nt_mcp_server.nt_read_topics(
+            ["/SmartDashboard/test_num"], include_metadata=include_metadata
+        ) == {"connected": False, "error": "NT server disconnected"}
     response = await nt_mcp_server.nt_get_topic_info("/SmartDashboard/test_num")
     assert response["connected"] is False
     assert "error" in response

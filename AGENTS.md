@@ -32,6 +32,17 @@ Each new recording has a sibling `.meta.json` sidecar. `capture_duration_seconds
 
 Connect target rules: `nt_connect` takes exactly one target — `team_number`, or `server_ip`/`server_port` with the default `server_ip`. An ambiguous target (both `team_number` and a non-default `server_ip`) is refused before any state change; re-targeting a running client is refused (`nt_disconnect` first). The resolved target is reported as `target` in `nt_connect`/`nt_connection_info` responses; the `team_number` path's pyntcore address list is not yet verified against real hardware.
 
+`nt_read_topics(include_metadata=True)` adds a per-topic `metadata` map
+(`type`, `valid`, `local_time_us`, `server_time_us`) alongside `values`.
+The manager uses one atomic NT `Value` snapshot per topic for both maps;
+batch reads are sequential, not atomic across topics. Types are NT storage
+types (`int`, `double`, `int[]`, etc.), not inferred from JSON. Invalid
+values have null type/timestamps. Timestamps are integer microseconds in
+the client/server NT clock domains; nonpositive timestamps and the pinned
+library's local-value server-time placeholder `1` become null. Never assume
+wall-clock/FPGA time or command acknowledgment. Default/disconnected read
+responses are unchanged.
+
 ## NT4 gotchas (cost real debugging time)
 
 - An NT4 client only receives a topic/value once it has a matching subscription. `NTManager` keeps a topics-only subscription on `"/"` so the topic store stays populated; first `list_topics`/`get` after connect polls briefly for the server to announce topics. Don't assume topics exist before syncing.

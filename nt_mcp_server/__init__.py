@@ -512,15 +512,41 @@ def nt_connection_info() -> dict:
         "openWorldHint": True,
     }
 )
-async def nt_read_topics(topics: TopicNames) -> dict:
+async def nt_read_topics(
+    topics: TopicNames,
+    include_metadata: Annotated[
+        bool,
+        Field(description=(
+            "Add per-topic NT value type, validity, local_time_us and server_time_us "
+            "from the same value snapshot. Timestamps are integer microseconds in "
+            "the client's local NT clock and NT server clock, not assumed wall-clock "
+            "or robot FPGA time; unavailable timestamps (including the local "
+            "value's server-time placeholder 1) are null. Topics are read "
+            "sequentially, not atomically as a batch. Defaults to values only."
+        )),
+    ] = False,
+) -> dict:
     """Read current values for one or more exact topic names.
 
     Returns ``{"connected": bool, "values": {topic: value | null}}``;
-    unknown topics have null values. ``nt_get_topic_info`` returns type and
-    properties, and ``nt_sample`` observes changes over a time window.
+    unknown topics have null values. Opt in with ``include_metadata=True``
+    to add ``metadata: {topic: {type, valid, local_time_us, server_time_us}}``.
+    Each value and its metadata come from one atomic NT value snapshot;
+    the batch is not atomic across topics. Type is the NT storage type,
+    not inferred from JSON. Invalid values have null type/timestamps;
+    nonpositive/unavailable timestamps and the server-time placeholder 1
+    are null even for valid values.
+    Timestamps are microseconds in the local client and server NT clocks,
+    not assumed wall-clock or robot FPGA time. A value timestamp is not
+    acknowledgment of a command on another topic; robot-side clock
+    comparisons may require robot-side instrumentation.
+    ``nt_get_topic_info`` returns topic type labels/properties, and
+    ``nt_sample`` observes changes over a time window.
     """
     if not manager.is_connected():
         return {"connected": False, "error": "NT server disconnected"}
+    if include_metadata:
+        return {"connected": True, **await manager.get_multiple_with_metadata(topics)}
     return {"connected": True, "values": await manager.get_multiple(topics)}
 
 
