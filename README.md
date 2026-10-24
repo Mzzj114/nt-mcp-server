@@ -85,6 +85,60 @@ Live sampling, subscriptions, recordings and recording queries share `prefixes`,
 
 `nt_sample` blocks for its fixed window and returns inline results. For an interactive test, call `nt_start_recording`, perform the test, then call `nt_stop_recording`. Use the returned ID for offline analysis after the file closes.
 
+### Read value metadata
+
+`nt_read_topics(topics=["/limelight/tv", "/missing"], include_metadata=True)` adds a
+`metadata` map alongside the existing `values` map. Omitting the flag (or
+passing `False`) preserves the compact `{connected, values}` response.
+
+```json
+{
+  "connected": true,
+  "values": {"/limelight/tv": 0.0, "/missing": null},
+  "metadata": {
+    "/limelight/tv": {
+      "type": "double",
+      "valid": true,
+      "local_time_us": 123456789,
+      "server_time_us": 987654321
+    },
+    "/missing": {
+      "type": null,
+      "valid": false,
+      "local_time_us": null,
+      "server_time_us": null
+    }
+  }
+}
+```
+
+Every requested topic appears in both maps. `type` is the NT value's storage
+type, preserving `int` versus `double`, `float`, and array types such as
+`int[]` and `double[]`; it is not inferred from the JSON value. Custom topic
+type labels (such as `json` or struct schemas) and properties are available
+through `nt_get_topic_info`. `valid` describes the NT value before JSON
+normalization: raw values still normalize to `null` but can be valid with
+`type: "raw"`. Missing/unassigned values have `valid: false` and null
+value, type and timestamps, including advertised topics with no value yet.
+Disconnected reads retain `{connected: false, error: ...}` with either flag.
+
+Both timestamps are integer **microseconds** for the pinned pyntcore version.
+`local_time_us` is the value creation/update timestamp in this client's NT
+clock domain (`nt::Now()`); `server_time_us` is that timestamp in the NT
+server's clock domain. Neither should be assumed to be Unix/wall-clock time
+or robot FPGA time. Nonpositive NT timestamps (including unknown server
+time), and the pinned library's server-time placeholder `1` for locally
+created values, are returned as `null`, even when the value is valid. Comparing to a
+robot-side clock may require robot-side instrumentation. See the
+[NT Value implementation](https://github.com/wpilibsuite/allwpilib/blob/v2026.2.2/ntcore/src/main/native/include/networktables/NetworkTableValue.h)
+and the installed `ntcore._now()` documentation for the NT clock time base.
+
+Each topic's value, type, validity and timestamps come from one atomic NT
+value snapshot. The batch reads topics sequentially; it is **not an atomic
+snapshot across topics**. These are cached current values and do not wait
+for a fresh publication. A timestamp provides evidence of a value update;
+it does not acknowledge execution of a command sent through another topic.
+
 ### Offline recording tools
 
 | Tool                    | Description                                                                                                                                                                                                                                                                                                                      |

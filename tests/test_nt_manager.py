@@ -223,6 +223,134 @@ async def test_get_multiple_flat_dict_with_none(manager: NTManager) -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("kind, expected_type, value, normalized", [
+    ("Boolean", "boolean", False, False),
+    ("Integer", "int", 7, 7),
+    ("Float", "float", 2.5, 2.5),
+    ("Double", "double", 7.0, 7.0),
+    ("String", "string", "hello", "hello"),
+    ("Raw", "raw", b"bytes", None),
+    ("BooleanArray", "boolean[]", [True, False], [True, False]),
+    ("IntegerArray", "int[]", [1, 2], [1, 2]),
+    ("FloatArray", "float[]", [1.5, 2.5], [1.5, 2.5]),
+    ("DoubleArray", "double[]", [1.0, 2.0], [1.0, 2.0]),
+    ("StringArray", "string[]", ["a", "b"], ["a", "b"]),
+    ("IntegerArray", "int[]", [], []),
+    ("DoubleArray", "double[]", [], []),
+])
+async def test_read_metadata_preserves_nt_storage_types(
+    manager: NTManager, nt_server: ntcore.NetworkTableInstance,
+    kind: str, expected_type: str, value: Any, normalized: Any,
+) -> None:
+    """NT4 snapshots preserve types that JSON alone cannot distinguish."""
+    topic = f"/Metadata/{kind}_{'empty' if value == [] else 'value'}"
+    server_entry = nt_server.getEntry(topic)
+    # Typed publishers advertise float[] correctly; the pinned legacy
+    # entry.setValue(Value.makeFloatArray(...)) advertises it as float.
+    typed_topic = getattr(nt_server, f"get{kind}Topic")(topic)
+    publisher = typed_topic.publish("raw") if kind == "Raw" else typed_topic.publish()
+    try:
+        publisher.set(value)
+        nt_server.flush()
+        response = await manager.get_multiple_with_metadata([topic])
+        assert response["values"] == {topic: normalized}
+        metadata = response["metadata"][topic]
+        snapshot = manager._instance().getEntry(topic).getValue()
+        assert metadata == {
+            "type": expected_type, "valid": True,
+            "local_time_us": snapshot.time(),
+            "server_time_us": server_entry.getValue().time(),
+        }
+        json.dumps(response)
+    finally:
+        publisher.close()
+
+
+@pytest.mark.anyio
+async def test_read_metadata_advertised_without_value(
+    manager: NTManager, nt_server: ntcore.NetworkTableInstance,
+) -> None:
+    """A known topic with no available snapshot has explicit invalid metadata."""
+    topic = "/Metadata/no_value"
+    publisher = nt_server.getDoubleTopic(topic).publish()
+    try:
+        async def announced() -> bool:
+            return topic in await manager.list_topics()
+
+        assert await wait_until(announced)
+        response = await manager.get_multiple_with_metadata([topic])
+        assert response == {
+            "values": {topic: None},
+            "metadata": {topic: {
+                "type": None, "valid": False,
+                "local_time_us": None, "server_time_us": None,
+            }},
+        }
+    finally:
+        publisher.close()
+
+
+@pytest.mark.anyio
+async def test_read_metadata_local_value_has_no_server_timestamp(
+    manager: NTManager,
+) -> None:
+    """A native locally created value's server-time placeholder is unavailable."""
+    topic = "/Metadata/local_value"
+    assert manager.set(topic, 5)["ok"]
+    snapshot = manager._instance().getEntry(topic).getValue()
+    assert snapshot.server_time() == 1
+    response = await manager.get_multiple_with_metadata([topic])
+    assert response["values"] == {topic: 5}
+    assert response["metadata"][topic] == {
+        "type": "int", "valid": True,
+        "local_time_us": snapshot.time(), "server_time_us": None,
+    }
+
+
+@pytest.mark.anyio
+async def test_read_metadata_timestamps_follow_the_value_snapshot(
+    manager: NTManager, nt_server: ntcore.NetworkTableInstance,
+) -> None:
+    """Encode server timestamps in values to detect torn reads during updates."""
+    topic = "/Metadata/updating"
+    publisher = nt_server.getDoubleTopic(topic).publish()
+    first_stamp = ntcore._now()
+    publisher.set(float(first_stamp), first_stamp)
+    nt_server.flush()
+    try:
+        initial = await manager.get_multiple_with_metadata([topic])
+        assert initial["values"][topic] == first_stamp
+
+        async def update() -> None:
+            for _ in range(30):
+                stamp = ntcore._now()
+                publisher.set(float(stamp), stamp)
+                nt_server.flush()
+                await asyncio.sleep(0.01)
+
+        task = asyncio.create_task(update())
+        observed = set()
+        try:
+            for _ in range(60):
+                response = await manager.get_multiple_with_metadata([topic])
+                value = response["values"][topic]
+                metadata = response["metadata"][topic]
+                assert metadata["valid"] is True
+                assert metadata["type"] == "double"
+                assert metadata["server_time_us"] == value
+                assert type(metadata["local_time_us"]) is int
+                assert metadata["local_time_us"] > 0
+                observed.add(value)
+                await asyncio.sleep(0.01)
+        finally:
+            await task
+        assert len(observed) > 1
+        assert max(observed) > first_stamp
+    finally:
+        publisher.close()
+
+
+@pytest.mark.anyio
 async def test_set_integer_roundtrip_preserves_int(manager: NTManager) -> None:
     res = manager.set("/SmartDashboard/client_int", 7)
     assert res == {"ok": True, "warning": None}

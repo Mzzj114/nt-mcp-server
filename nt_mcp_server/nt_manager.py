@@ -34,6 +34,21 @@ _ANNOUNCE_WAIT_SECONDS = 0.5
 DEFAULT_SERVER_IP = "127.0.0.1"
 DEFAULT_SERVER_PORT = 5810
 
+# Storage types from the NT Value snapshot, not inferred from JSON values.
+_VALUE_TYPES = {
+    ntcore.NetworkTableType.kBoolean: "boolean",
+    ntcore.NetworkTableType.kInteger: "int",
+    ntcore.NetworkTableType.kFloat: "float",
+    ntcore.NetworkTableType.kDouble: "double",
+    ntcore.NetworkTableType.kString: "string",
+    ntcore.NetworkTableType.kRaw: "raw",
+    ntcore.NetworkTableType.kBooleanArray: "boolean[]",
+    ntcore.NetworkTableType.kIntegerArray: "int[]",
+    ntcore.NetworkTableType.kFloatArray: "float[]",
+    ntcore.NetworkTableType.kDoubleArray: "double[]",
+    ntcore.NetworkTableType.kStringArray: "string[]",
+}
+
 
 class NTConnectError(RuntimeError):
     """Base error for connect target conflicts."""
@@ -302,19 +317,15 @@ class NTManager:
             names = [name for name in names if fnmatch.fnmatch(name, wildcard)]
         return names
 
-    async def get(self, topic: str) -> Any:
-        """Return the JSON-normalized value of ``topic`` or ``None``.
-
-        Unpublished topics produce an invalid ``Value``, which maps to
-        ``None`` instead of raising. Metadata (valid/type/time) is never
-        exposed; the raw value is normalized through ``to_jsonable``.
+    async def _get_value(self, topic: str) -> ntcore.Value:
+        """Return one atomic NT value snapshot, possibly invalid.
 
         A client only receives a remote topic's value while a
         subscription exists, so the first read of a topic creates a
         cached ``GenericSubscriber`` and polls the entry store — yielding
         via ``await asyncio.sleep`` — until the value arrives or
         ``_READ_TIMEOUT_SECONDS`` elapses. When the client is not
-        running, an invalid value is returned as ``None`` immediately
+        running, an invalid value is returned immediately
         without polling.
         """
         inst = self._instance()
@@ -333,9 +344,17 @@ class NTManager:
                 await asyncio.sleep(0.01)
             for _ in subscriber.readQueue():  # drain; store updates in the background
                 pass
-        if not value.isValid():
-            return None
-        return to_jsonable(value.value())
+        return value
+
+    async def get(self, topic: str) -> Any:
+        """Return the JSON-normalized value of ``topic`` or ``None``.
+
+        Unpublished topics produce an invalid snapshot, which maps to
+        ``None`` instead of raising. See ``_get_value`` for subscription
+        and polling behavior.
+        """
+        value = await self._get_value(topic)
+        return to_jsonable(value.value()) if value.isValid() else None
 
     async def get_multiple(self, topics: list[str]) -> dict[str, Any]:
         """Return ``{topic: value}`` for each topic.
@@ -344,6 +363,35 @@ class NTManager:
         in the result. Reads run sequentially in submission order.
         """
         return {topic: await self.get(topic) for topic in topics}
+
+    async def get_multiple_with_metadata(self, topics: list[str]) -> dict[str, Any]:
+        """Return values and metadata maps from one NT snapshot per topic.
+
+        ``type`` is the snapshot's NT storage type (e.g. ``int``, ``double[]``),
+        or None for an invalid value. Positive timestamps are microseconds
+        in the client's local NT clock and the NT server clock respectively;
+        nonpositive/unavailable timestamps become None (including the pinned
+        NT Value factory's server-time placeholder of 1). Reads are sequential,
+        not atomic across topics. Custom topic type labels/properties remain
+        available separately through ``get_info``.
+        """
+        values: dict[str, Any] = {}
+        metadata: dict[str, Any] = {}
+        for topic in topics:
+            snapshot = await self._get_value(topic)
+            valid = snapshot.isValid()
+            values[topic] = to_jsonable(snapshot.value()) if valid else None
+            local_time = snapshot.time() if valid else 0
+            server_time = snapshot.server_time() if valid else 0
+            # In pinned NT Value factories, 1 is a local value's placeholder,
+            # not a measured timestamp in the server clock domain.
+            metadata[topic] = {
+                "type": _VALUE_TYPES.get(snapshot.type()) if valid else None,
+                "valid": valid,
+                "local_time_us": local_time if local_time > 0 else None,
+                "server_time_us": server_time if server_time > 1 else None,
+            }
+        return {"values": values, "metadata": metadata}
 
     async def get_info(self, topic: str) -> dict | None:
         """Return JSON-serializable metadata for ``topic`` or ``None``.
