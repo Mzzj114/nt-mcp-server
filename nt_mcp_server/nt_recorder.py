@@ -555,6 +555,7 @@ def get_recording_info(
     regex: str | None = None,
     wildcard: str | None = None,
     topic_limit: int = 100,
+    include_activity: bool = False,
 ) -> dict:
     """Return metadata for a recording.
 
@@ -564,6 +565,13 @@ def get_recording_info(
     Legacy recordings without a metadata sidecar use event span and report
     ``duration_source="event_span"``. Also includes sample/topic counts and
     ordinary file metadata. Missing files return an ``error`` key.
+
+    ``include_activity=True`` adds a bounded ``activity`` map for the first
+    ``topic_limit`` matching topics, with ``first_time``, ``last_time``,
+    ``span_seconds``, ``mean_interval_seconds``, ``effective_hz``,
+    ``max_gap_seconds`` and ``last_change_age_seconds`` (relative to the
+    recording's latest event timestamp). ``activity_truncated`` reports
+    whether more matching topics exist.
     """
     if not 1 <= topic_limit <= 1000:
         raise ValueError("topic_limit must be between 1 and 1000")
@@ -577,6 +585,7 @@ def get_recording_info(
     max_time = None
     total = 0
     topics: set[str] = set()
+    times_by_topic: dict[str, list[float]] = {}
     for event in _iter_events(path):
         total += 1
         timestamp = event.get("time")
@@ -586,6 +595,8 @@ def get_recording_info(
         topic = event.get("topic")
         if isinstance(topic, str):
             topics.add(topic)
+            if isinstance(timestamp, (int, float)) and timestamp > 0:
+                times_by_topic.setdefault(topic, []).append(timestamp)
     event_span = max_time - min_time if min_time is not None else 0.0
     matching_topics = sorted(topic for topic in topics if selector.matches(topic))
     stat = os.stat(path)
@@ -616,6 +627,14 @@ def get_recording_info(
         "topics_returned": min(len(matching_topics), topic_limit),
         "topics_truncated": len(matching_topics) > topic_limit,
     }
+    if include_activity:
+        activity = {
+            topic: _activity_from_times(times_by_topic.get(topic, ()), max_time)
+            for topic in matching_topics[:topic_limit]
+        }
+        result["activity"] = activity
+        result["activity_returned"] = len(activity)
+        result["activity_truncated"] = len(matching_topics) > topic_limit
     if metadata is not None:
         result.update(
             {
@@ -631,6 +650,112 @@ def get_recording_info(
             }
         )
     return result
+
+
+def _activity_from_times(
+    times: Iterator[float] | list[float],
+    global_last: float | None,
+) -> dict[str, Any]:
+    """Summarize one topic's event timing for recording discovery."""
+    positive = sorted(t for t in times if t > 0)
+    if not positive:
+        return {"count": 0}
+    first = positive[0]
+    last = positive[-1]
+    span = last - first
+    gaps = [later - earlier for earlier, later in zip(positive, positive[1:])]
+    return {
+        "count": len(positive),
+        "first_time": first,
+        "last_time": last,
+        "span_seconds": span,
+        "mean_interval_seconds": (
+            span / (len(positive) - 1) if len(positive) > 1 else None
+        ),
+        "effective_hz": ((len(positive) - 1) / span) if span > 0 else None,
+        "max_gap_seconds": max(gaps) if gaps else 0.0,
+        "last_change_age_seconds": (
+            global_last - last if global_last is not None else None
+        ),
+    }
+
+
+def get_windows(
+    prefixes: list[str] | None = None,
+    recording_id: str | None = None,
+    output_dir: str = "./recordings",
+    start: float | None = None,
+    end: float | None = None,
+    last_seconds: float | None = None,
+    limit: int | None = None,
+    topics: list[str] | None = None,
+    regex: str | None = None,
+    wildcard: str | None = None,
+    gap_seconds: float = 1.0,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return contiguous activity windows per topic.
+
+    A window starts when a topic has no event for more than ``gap_seconds``
+    and ends at its last event in the burst. Each window reports ``start``,
+    ``end``, ``duration_seconds``, ``samples`` and
+    ``mean_interval_seconds``. ``start`` is inclusive and ``end`` is
+    exclusive for the query window. ``limit`` caps windows per topic.
+    """
+    if gap_seconds <= 0:
+        raise ValueError("gap_seconds must be greater than 0")
+    selector = TopicSelector(prefixes, topics, regex, wildcard)
+    if selector.empty:
+        raise ValueError("at least one topic selector is required")
+    path = _resolve_recording(recording_id, output_dir)
+    if path is None:
+        return {}
+    start, end = _apply_time_filter(path, start, end, last_seconds)
+    times: dict[str, list[float]] = {}
+    for t, event in _iter_timed_events(path):
+        topic = event.get("topic")
+        if not isinstance(topic, str) or not selector.matches(topic):
+            continue
+        if start is not None and t < start:
+            continue
+        if end is not None and t >= end:
+            continue
+        if t <= 0:
+            continue
+        times.setdefault(topic, []).append(t)
+
+    out: dict[str, list[dict[str, Any]]] = {}
+    for topic, topic_times in times.items():
+        topic_times.sort()
+        windows: list[dict[str, Any]] = []
+        window_start = topic_times[0]
+        window_last = topic_times[0]
+        samples = 1
+        for timestamp in topic_times[1:]:
+            if timestamp - window_last > gap_seconds:
+                windows.append(_window(window_start, window_last, samples))
+                window_start = timestamp
+                samples = 1
+            else:
+                samples += 1
+            window_last = timestamp
+        windows.append(_window(window_start, window_last, samples))
+        if limit is not None:
+            windows = windows[:limit]
+        out[topic] = windows
+    return out
+
+
+def _window(start: float, end: float, samples: int) -> dict[str, Any]:
+    """Build one activity-window record."""
+    span = end - start
+    return {
+        "start": start,
+        "end": end,
+        "duration_seconds": span,
+        "samples": samples,
+        "mean_interval_seconds": (span / (samples - 1) if samples > 1 else None),
+    }
+
 
 
 def subscribe_offline(

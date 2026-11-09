@@ -334,6 +334,103 @@ def test_reader_get_recording_info_ignores_zero_timestamps(tmp_path) -> None:
     assert info["topic_count"] == 1
 
 
+def _write_activity_recording(tmp_path) -> str:
+    """Write two topics with a clear quiet gap and a later event elsewhere."""
+    recording = tmp_path / "activity.ndjson"
+    events = [
+        {"time": 1000.0, "topic": "/drive/x", "value": 1},
+        {"time": 1001.0, "topic": "/drive/x", "value": 2},
+        {"time": 1002.0, "topic": "/drive/x", "value": 3},
+        {"time": 1010.0, "topic": "/drive/x", "value": 4},
+        {"time": 1011.0, "topic": "/drive/x", "value": 5},
+        {"time": 1000.0, "topic": "/drive/y", "value": 1},
+        {"time": 1005.0, "topic": "/drive/y", "value": 2},
+    ]
+    recording.write_text(
+        "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+    )
+    return recording.name
+
+
+def test_reader_activity_reports_rate_and_gaps(tmp_path) -> None:
+    """include_activity exposes effective rate, gaps and terminal staleness."""
+    recording_id = _write_activity_recording(tmp_path)
+    info = nt_recorder.get_recording_info(
+        recording_id=recording_id,
+        output_dir=str(tmp_path),
+        include_activity=True,
+    )
+    activity = info["activity"]["/drive/x"]
+    assert activity["count"] == 5
+    assert activity["first_time"] == 1000.0
+    assert activity["last_time"] == 1011.0
+    assert activity["span_seconds"] == pytest.approx(11.0)
+    assert activity["mean_interval_seconds"] == pytest.approx(11.0 / 4)
+    assert activity["effective_hz"] == pytest.approx(4 / 11.0)
+    assert activity["max_gap_seconds"] == pytest.approx(8.0)
+    assert activity["last_change_age_seconds"] == pytest.approx(0.0)
+    stalled = info["activity"]["/drive/y"]
+    assert stalled["max_gap_seconds"] == pytest.approx(5.0)
+    assert stalled["last_change_age_seconds"] == pytest.approx(6.0)
+    assert info["activity_returned"] == 2
+    assert info["activity_truncated"] is False
+
+
+def test_reader_activity_is_opt_in_and_bounded(tmp_path) -> None:
+    """Activity is omitted by default and clipped with the topic list."""
+    recording_id = _write_activity_recording(tmp_path)
+    plain = nt_recorder.get_recording_info(
+        recording_id=recording_id, output_dir=str(tmp_path)
+    )
+    assert "activity" not in plain
+    bounded = nt_recorder.get_recording_info(
+        recording_id=recording_id,
+        output_dir=str(tmp_path),
+        topic_limit=1,
+        include_activity=True,
+    )
+    assert bounded["topics"] == ["/drive/x"]
+    assert set(bounded["activity"]) == {"/drive/x"}
+    assert bounded["activity_returned"] == 1
+    assert bounded["activity_truncated"] is True
+
+
+def test_reader_windows_split_on_quiet_gap(tmp_path) -> None:
+    """Windows group contiguous events and split on gaps above the threshold."""
+    recording_id = _write_activity_recording(tmp_path)
+    windows = nt_recorder.get_windows(
+        prefixes=["/drive/"],
+        recording_id=recording_id,
+        output_dir=str(tmp_path),
+        gap_seconds=2.0,
+    )
+    assert [window["samples"] for window in windows["/drive/x"]] == [3, 2]
+    assert windows["/drive/x"][0]["start"] == 1000.0
+    assert windows["/drive/x"][0]["end"] == 1002.0
+    assert windows["/drive/x"][0]["duration_seconds"] == pytest.approx(2.0)
+    assert windows["/drive/x"][1]["start"] == 1010.0
+    assert windows["/drive/x"][1]["end"] == 1011.0
+    assert [window["samples"] for window in windows["/drive/y"]] == [1, 1]
+    assert windows["/drive/y"][0]["mean_interval_seconds"] is None
+
+
+def test_reader_windows_respects_time_filter_and_limit(tmp_path) -> None:
+    """Window queries apply the time window and per-topic window cap."""
+    recording_id = _write_activity_recording(tmp_path)
+    windows = nt_recorder.get_windows(
+        prefixes=["/drive/x"],
+        recording_id=recording_id,
+        output_dir=str(tmp_path),
+        start=1001.0,
+        end=1011.0,
+        gap_seconds=2.0,
+        limit=1,
+    )
+    assert len(windows["/drive/x"]) == 1
+    assert windows["/drive/x"][0]["start"] == 1001.0
+    assert windows["/drive/x"][0]["end"] == 1002.0
+
+
 @pytest.mark.anyio
 async def test_reader_list_recordings_and_most_recent_default(
     manager: NTManager, tmp_path

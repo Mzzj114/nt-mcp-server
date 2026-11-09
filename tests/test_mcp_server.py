@@ -940,6 +940,77 @@ async def test_nt_get_recording_info_returns_topics(mcp_synced: None, tmp_path) 
     json.dumps(prefixed)
 
 
+def _write_activity_recording(tmp_path) -> str:
+    """Write two topics with a quiet gap, returning the recording id."""
+    recording = tmp_path / "mcp-activity.ndjson"
+    events = [
+        {"time": 1000.0, "topic": "/drive/x", "value": 1},
+        {"time": 1001.0, "topic": "/drive/x", "value": 2},
+        {"time": 1002.0, "topic": "/drive/x", "value": 3},
+        {"time": 1010.0, "topic": "/drive/x", "value": 4},
+        {"time": 1011.0, "topic": "/drive/x", "value": 5},
+        {"time": 1000.0, "topic": "/drive/y", "value": 1},
+        {"time": 1005.0, "topic": "/drive/y", "value": 2},
+    ]
+    recording.write_text(
+        "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+    )
+    return recording.name
+
+
+def test_nt_get_recording_info_returns_activity(tmp_path) -> None:
+    """include_activity adds per-topic timing without changing topic discovery."""
+    recording_id = _write_activity_recording(tmp_path)
+    info = nt_mcp_server.nt_get_recording_info(
+        recording_id=recording_id,
+        output_dir=str(tmp_path),
+        include_activity=True,
+    )
+    assert info["topics"] == ["/drive/x", "/drive/y"]
+    activity = info["activity"]["/drive/x"]
+    assert activity["first_time"] == 1000.0
+    assert activity["last_time"] == 1011.0
+    assert activity["effective_hz"] == pytest.approx(4 / 11.0)
+    assert activity["max_gap_seconds"] == pytest.approx(8.0)
+    assert activity["last_change_age_seconds"] == pytest.approx(0.0)
+    assert info["activity_truncated"] is False
+    json.dumps(info)
+
+
+def test_nt_query_recording_windows(tmp_path) -> None:
+    """output='windows' returns contiguous activity intervals per topic."""
+    recording_id = _write_activity_recording(tmp_path)
+    result = nt_mcp_server.nt_query_recording(
+        prefixes=["/drive/"],
+        recording_id=recording_id,
+        output_dir=str(tmp_path),
+        output="windows",
+        window_gap_seconds=2.0,
+    )
+    assert result["rows"] == 4
+    assert result["total_rows"] == 4
+    assert result["truncated"] is False
+    assert [window["samples"] for window in result["topics"]["/drive/x"]] == [3, 2]
+    assert [window["samples"] for window in result["topics"]["/drive/y"]] == [1, 1]
+    json.dumps(result)
+
+
+def test_nt_query_recording_windows_respects_budget(tmp_path) -> None:
+    """Window mode reports clipping through rows/truncated."""
+    recording_id = _write_activity_recording(tmp_path)
+    result = nt_mcp_server.nt_query_recording(
+        prefixes=["/drive/"],
+        recording_id=recording_id,
+        output_dir=str(tmp_path),
+        output="windows",
+        window_gap_seconds=2.0,
+        max_rows=2,
+    )
+    assert result["rows"] == 2
+    assert result["total_rows"] == 4
+    assert result["truncated"] is True
+
+
 @pytest.mark.anyio
 async def test_nt_query_recording_returns_dict(mcp_synced: None, tmp_path) -> None:
     """Given a recording, nt_query_recording buckets events by topic."""
