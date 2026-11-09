@@ -809,7 +809,11 @@ def get_recording_info(
         topic = event.get("topic")
         if isinstance(topic, str):
             topics.add(topic)
-            if isinstance(timestamp, (int, float)) and timestamp > 0:
+            if (
+                include_activity
+                and isinstance(timestamp, (int, float))
+                and timestamp > 0
+            ):
                 times_by_topic.setdefault(topic, []).append(timestamp)
     event_span = max_time - min_time if min_time is not None else 0.0
     matching_topics = sorted(topic for topic in topics if selector.matches(topic))
@@ -1031,7 +1035,6 @@ def build_table(
         }
     start, end = _apply_time_filter(path, start, end, last_seconds, time_basis)
     series: dict[str, dict[str, list[Any]]] = {}
-    total_rows = 0
     decimator = StreamDecimator(
         sample_interval=(
             sample_interval if sample_interval and sample_interval > 0 else None
@@ -1045,7 +1048,6 @@ def build_table(
             continue
         if end is not None and t >= end:
             continue
-        total_rows += 1
         if not decimator.keep(topic, event.get("value"), t):
             continue
         bucket = series.setdefault(topic, {"times": [], "values": []})
