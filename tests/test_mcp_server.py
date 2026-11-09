@@ -1691,7 +1691,12 @@ async def test_recording_receipt_topic_preview_preserves_full_discovery(
         start = await nt_mcp_server.nt_start_recording(
             topics=topics, output_dir=str(tmp_path)
         )
-        await asyncio.sleep(0.5)
+
+        async def captured() -> bool:
+            recorder = nt_mcp_server._recorders.get(start["recording_id"])
+            return recorder is not None and recorder.rows >= len(topics)
+
+        assert await wait_until(captured, timeout=5.0), "recorder missed initial values"
         receipt = await nt_mcp_server.nt_stop_recording(start["recording_id"])
         assert receipt["stopped"] is True
         assert receipt["rows"] >= len(topics)
