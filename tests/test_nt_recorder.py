@@ -444,6 +444,7 @@ def _write_capture_recording(tmp_path) -> str:
     )
     metadata = {
         "schema_version": 1,
+        "event_time_fields": ["time", "capture_time"],
         "recording_id": recording.name,
         "capture_started_at": 999.0,
         "capture_started_iso": "1970-01-01T00:16:39+00:00",
@@ -597,6 +598,30 @@ def test_reader_capture_basis_requires_metadata(tmp_path) -> None:
         nt_recorder.subscribe_offline(
             topics=["/x"],
             recording_id=recording_id,
+            output_dir=str(tmp_path),
+            time_basis="capture",
+        )
+
+
+def test_reader_capture_basis_rejects_sidecar_without_event_times(tmp_path) -> None:
+    """An older sidecar without per-event capture_time is not capture-capable."""
+    recording = tmp_path / "old-sidecar.ndjson"
+    recording.write_text(
+        json.dumps({"time": 1000.0, "topic": "/x", "value": 1}), encoding="utf-8"
+    )
+    (tmp_path / "old-sidecar.meta.json").write_text(
+        json.dumps(
+            {
+                "capture_started_at": 999.0,
+                "capture_ended_at": 1005.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="per-event capture_time"):
+        nt_recorder.subscribe_offline(
+            topics=["/x"],
+            recording_id=recording.name,
             output_dir=str(tmp_path),
             time_basis="capture",
         )

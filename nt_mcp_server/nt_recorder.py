@@ -522,13 +522,19 @@ def list_topics(
 
 
 def _require_capture_metadata(path: str) -> dict[str, Any]:
-    """Return capture metadata, refusing legacy files for capture-clock reads."""
+    """Return capture metadata, refusing files without per-event capture times."""
     metadata = _read_capture_metadata(path)
     if metadata is None or metadata.get("capture_started_at") is None:
         raise ValueError(
             "time_basis='capture' requires recording capture metadata "
             "(the .meta.json sidecar with capture_started_at); legacy "
             "recordings support only time_basis='event'"
+        )
+    if "capture_time" not in (metadata.get("event_time_fields") or ()):
+        raise ValueError(
+            "time_basis='capture' requires per-event capture_time; this "
+            "recording has only NT event timestamps, so use "
+            "time_basis='event'"
         )
     return metadata
 

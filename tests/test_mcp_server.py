@@ -1083,6 +1083,7 @@ def _write_capture_recording(tmp_path) -> str:
         json.dumps(
             {
                 "schema_version": 1,
+                "event_time_fields": ["time", "capture_time"],
                 "recording_id": recording.name,
                 "capture_started_at": 999.0,
                 "capture_started_iso": "1970-01-01T00:16:39+00:00",
@@ -1130,6 +1131,16 @@ def test_nt_query_recording_capture_time_basis_is_legacy_safe(tmp_path) -> None:
         time_basis="capture",
     )
     assert "requires recording capture metadata" in result["error"]
+    (tmp_path / "legacy.meta.json").write_text(
+        json.dumps({"capture_started_at": 999.0}), encoding="utf-8"
+    )
+    result = nt_mcp_server.nt_query_recording(
+        topics=["/x"],
+        recording_id=recording.name,
+        output_dir=str(tmp_path),
+        time_basis="capture",
+    )
+    assert "per-event capture_time" in result["error"]
     assert result["rows"] == 0
     assert result["truncated"] is False
 
