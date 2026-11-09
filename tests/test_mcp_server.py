@@ -829,6 +829,63 @@ async def test_nt_nonblocking_recording_lifecycle(mcp_synced: None, tmp_path) ->
     assert "error" in missing
 
 
+@pytest.mark.anyio
+async def test_nt_recording_label_and_idle_stop(mcp_synced: None, tmp_path) -> None:
+    """Labels persist across receipts/listings and idle capture self-stops."""
+    start = await nt_mcp_server.nt_start_recording(
+        topics=[FIXTURE_NAMES[0]],
+        output_dir=str(tmp_path),
+        label="auto-run",
+        idle_stop_seconds=0.5,
+    )
+    assert start["started"] is True
+    assert start["label"] == "auto-run"
+    assert start["idle_stop_seconds"] == 0.5
+
+    await asyncio.sleep(1.0)
+    stop = await nt_mcp_server.nt_stop_recording(start["recording_id"])
+    assert stop["stopped"] is True
+    assert stop["label"] == "auto-run"
+    assert stop["idle_stopped"] is True
+    assert stop["idle_stop_seconds"] == 0.5
+    assert stop["last_activity_age_seconds"] >= 0.4
+
+    listed = nt_mcp_server.nt_list_recordings(output_dir=str(tmp_path))
+    entry = next(item for item in listed if item["id"] == start["recording_id"])
+    assert entry["label"] == "auto-run"
+    assert entry["idle_stopped"] is True
+    info = nt_mcp_server.nt_get_recording_info(
+        recording_id=start["recording_id"], output_dir=str(tmp_path)
+    )
+    assert info["label"] == "auto-run"
+    assert info["idle_stopped"] is True
+    assert info["last_activity_age_seconds"] >= 0.4
+
+
+@pytest.mark.anyio
+async def test_nt_recording_idle_timer_resets_on_activity(
+    mcp_synced: None, tmp_path
+) -> None:
+    """A steady event stream prevents the idle watchdog from ending capture."""
+    topic = "/SmartDashboard/idle_reset_num"
+
+    async def churn() -> None:
+        for index in range(12):
+            nt_mcp_server.nt_write_topics({topic: float(index)})
+            await asyncio.sleep(0.15)
+
+    churn_task = asyncio.create_task(churn())
+    start = await nt_mcp_server.nt_start_recording(
+        topics=[topic],
+        output_dir=str(tmp_path),
+        idle_stop_seconds=0.5,
+    )
+    await churn_task
+    stop = await nt_mcp_server.nt_stop_recording(start["recording_id"])
+    assert stop["idle_stopped"] is False
+    assert stop["rows"] >= 1
+
+
 # --- Offline MCP tool tests -------------------------------------------------
 
 

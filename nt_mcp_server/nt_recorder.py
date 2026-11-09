@@ -70,6 +70,8 @@ class Recorder:
         topics: list[str] | None = None,
         regex: str | None = None,
         wildcard: str | None = None,
+        label: str | None = None,
+        idle_stop_seconds: float | None = None,
     ) -> None:
         self.manager = manager
         self.output_dir = output_dir
@@ -93,6 +95,12 @@ class Recorder:
         self._topics: set[str] = set()
         self.topics: list[str] = []
         self.truncated = False
+        self.label = label
+        self.idle_stop_seconds = idle_stop_seconds
+        self.idle_stopped = False
+        self.last_activity_age_seconds: float | None = None
+        self._last_event_monotonic: float | None = None
+        self._capture_started_monotonic: float | None = None
         self.capture_started_at: float | None = None
         self.capture_ended_at: float | None = None
         self.capture_duration_seconds: float | None = None
@@ -112,6 +120,7 @@ class Recorder:
             with open(path, "w", encoding="utf-8") as file:
                 self.capture_started_at = time.time()
                 started_monotonic = time.monotonic()
+                self._capture_started_monotonic = started_monotonic
                 if self.duration is not None:
                     # asyncio.timeout fires at the generator's await point even
                     # when no events are flowing (bare time.monotonic checks
@@ -138,9 +147,14 @@ class Recorder:
                     await self._run_until_stop(file)
         finally:
             if started_monotonic is not None:
+                ended_monotonic = time.monotonic()
                 self.capture_ended_at = time.time()
                 self.capture_duration_seconds = max(
-                    0.0, time.monotonic() - started_monotonic
+                    0.0, ended_monotonic - started_monotonic
+                )
+                activity_anchor = self._last_event_monotonic or started_monotonic
+                self.last_activity_age_seconds = max(
+                    0.0, ended_monotonic - activity_anchor
                 )
             self.topics = sorted(self._topics)
             if self.event_started_at is not None and self.event_ended_at is not None:
@@ -175,28 +189,44 @@ class Recorder:
             "rows": self.rows,
             "topic_count": len(self.topics),
             "truncated": self.truncated,
+            "label": self.label,
+            "idle_stop_seconds": self.idle_stop_seconds,
+            "idle_stopped": self.idle_stopped,
+            "last_activity_age_seconds": self.last_activity_age_seconds,
         }
         with open(_metadata_path(path), "w", encoding="utf-8") as file:
             json.dump(metadata, file, separators=(",", ":"))
 
     async def _run_until_stop(self, file) -> None:
-        """Consume the stream until ``stop_event`` is set."""
+        """Consume the stream until ``stop_event`` or the idle timeout."""
         consume_task = asyncio.create_task(self._consume(file))
         stop_task = asyncio.create_task(self.stop_event.wait())
+        tasks = {consume_task, stop_task}
+        if self.idle_stop_seconds is not None:
+            tasks.add(asyncio.create_task(self._idle_watchdog()))
         try:
-            await asyncio.wait(
-                {consume_task, stop_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            for task in (consume_task, stop_task):
+            for task in tasks:
                 if not task.done():
                     task.cancel()
             # Drain: let the generator's finally close the subscriber and
             # poller; suppress only CancelledError, propagate real errors.
-            for task in (consume_task, stop_task):
+            for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+
+    async def _idle_watchdog(self) -> None:
+        """Stop capture after ``idle_stop_seconds`` without a written event."""
+        assert self.idle_stop_seconds is not None
+        interval = min(0.1, self.idle_stop_seconds)
+        while True:
+            await asyncio.sleep(interval)
+            started = self._capture_started_monotonic or time.monotonic()
+            last = self._last_event_monotonic or started
+            if time.monotonic() - last >= self.idle_stop_seconds:
+                self.idle_stopped = True
+                return
 
     async def _consume(self, file) -> None:
         async for topic, value, time_seconds in self.manager.subscribe_stream(
@@ -219,6 +249,7 @@ class Recorder:
         if not self._decimator.keep(topic, value, time_seconds):
             return True
         _write_event(file, topic, value, time_seconds, capture_time=time.time())
+        self._last_event_monotonic = time.monotonic()
         self.rows += 1
         self._topics.add(topic)
         if time_seconds > 0:
@@ -448,6 +479,10 @@ def list_recordings(output_dir: str = "./recordings") -> list[dict]:
                         "capture_ended_iso",
                         "capture_duration_seconds",
                         "event_span_seconds",
+                        "label",
+                        "idle_stop_seconds",
+                        "idle_stopped",
+                        "last_activity_age_seconds",
                     )
                 }
             )
@@ -825,6 +860,10 @@ def get_recording_info(
                     "capture_ended_iso",
                     "event_started_at",
                     "event_ended_at",
+                    "label",
+                    "idle_stop_seconds",
+                    "idle_stopped",
+                    "last_activity_age_seconds",
                 )
             }
         )

@@ -334,6 +334,10 @@ def _recording_receipt(
         "topics": topic_preview,
         "topics_truncated": len(topics) > len(topic_preview),
         "truncated": recorder.truncated,
+        "label": recorder.label,
+        "idle_stop_seconds": recorder.idle_stop_seconds,
+        "idle_stopped": recorder.idle_stopped,
+        "last_activity_age_seconds": recorder.last_activity_age_seconds,
     }
 
 
@@ -933,6 +937,22 @@ async def nt_start_recording(
     topics: SelectedTopics = None,
     regex: RegexFilter = None,
     wildcard: WildcardFilter = None,
+    label: Annotated[
+        str | None,
+        Field(
+            max_length=200,
+            description="Optional human-readable label stored in the receipt, metadata sidecar and recording listings.",
+        ),
+    ] = None,
+    idle_stop_seconds: Annotated[
+        float | None,
+        Field(
+            gt=0,
+            le=3600,
+            allow_inf_nan=False,
+            description="Optional auto-stop after this many seconds with no recorded event; useful for unattended test windows.",
+        ),
+    ] = None,
 ) -> dict:
     """Start an NDJSON recording and return its id immediately.
 
@@ -943,8 +963,11 @@ async def nt_start_recording(
     it does not periodically read unchanged values. ``sample_interval``
     filters received events rather than generating periodic readings.
     Selector kinds are ANDed; list entries ORed. With no selectors, records
-    every topic (equivalent to ``prefixes=["/"]``). ``nt_sample`` returns a
-    fixed window inline; ``nt_start_subscription`` buffers events for polling.
+    every topic (equivalent to ``prefixes=["/"]``). ``label`` is echoed by
+    receipts and recordings; ``idle_stop_seconds`` ends capture after a
+    quiet period so a forgotten stop does not inflate the file.
+    ``nt_sample`` returns a fixed window inline; ``nt_start_subscription``
+    buffers events for polling.
     """
     if not manager.is_connected():
         return {"connected": False, "error": "NT server disconnected"}
@@ -971,6 +994,8 @@ async def nt_start_recording(
         topics=topics,
         regex=regex,
         wildcard=wildcard,
+        label=label,
+        idle_stop_seconds=idle_stop_seconds,
     )
     task = asyncio.create_task(recorder.run())
     _recorders[recording_id] = recorder
@@ -991,6 +1016,8 @@ async def nt_start_recording(
         "recording_id": recording_id,
         "path": os.path.join(dir_, recording_id),
         "started": True,
+        "label": label,
+        "idle_stop_seconds": idle_stop_seconds,
     }
     if recorder.capture_started_at is not None:
         response["capture_started_at"] = recorder.capture_started_at
@@ -1010,8 +1037,11 @@ async def nt_start_recording(
 async def nt_stop_recording(recording_id: RecordingId) -> dict:
     """Stop a nonblocking recording and return its compact file receipt.
 
-    Timing and counts describe the full capture. ``topics`` previews at most
-    five names within 500 serialized characters; ``topics_truncated`` marks
+    Timing and counts describe the full capture. ``label``, ``idle_stopped``,
+    ``idle_stop_seconds`` and ``last_activity_age_seconds`` report the
+    recording label and whether an idle timeout ended capture, plus how long
+    the file was quiet before it closed. ``topics`` previews at most five
+    names within 500 serialized characters; ``topics_truncated`` marks
     omitted names, independently of the captured-row ``truncated`` flag.
     Use ``nt_get_recording_info`` with this ``recording_id`` and optional
     topic filters for bounded discovery of the recorded topics.
