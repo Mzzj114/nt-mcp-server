@@ -529,6 +529,26 @@ async def test_nt_recording_allows_bare_root_prefix(mcp_synced: None, tmp_path) 
 
 
 @pytest.mark.anyio
+async def test_nt_recording_without_selectors_captures_all(
+    mcp_synced: None, tmp_path
+) -> None:
+    """Omitting every selector records all topics instead of erroring."""
+    start = await nt_mcp_server.nt_start_recording(output_dir=str(tmp_path))
+    assert start["connected"] is True
+    assert start["started"] is True
+    await asyncio.sleep(0.5)
+    response = await nt_mcp_server.nt_stop_recording(start["recording_id"])
+    assert response["stopped"] is True
+    assert "error" not in response
+    assert response["rows"] >= 1
+    assert response["topic_count"] >= len(FIXTURE_NAMES)
+    info = nt_mcp_server.nt_get_recording_info(
+        output_dir=str(tmp_path), prefix="/SmartDashboard/test_"
+    )
+    assert set(FIXTURE_NAMES) <= set(info["topics"])
+
+
+@pytest.mark.anyio
 async def test_nt_sample_unknown_output_rejected(mcp_synced: None) -> None:
     """An unknown output mode returns a structured error listing modes."""
     response = await nt_mcp_server.nt_sample(

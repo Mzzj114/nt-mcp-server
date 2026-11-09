@@ -894,11 +894,14 @@ async def nt_start_recording(
     Records the same initial values and incoming updates as ``nt_sample``;
     it does not periodically read unchanged values. ``sample_interval``
     filters received events rather than generating periodic readings.
-    Selector kinds are ANDed; list entries ORed. ``nt_sample`` returns a
+    Selector kinds are ANDed; list entries ORed. With no selectors, records
+    every topic (equivalent to ``prefixes=["/"]``). ``nt_sample`` returns a
     fixed window inline; ``nt_start_subscription`` buffers events for polling.
     """
     if not manager.is_connected():
         return {"connected": False, "error": "NT server disconnected"}
+    if prefixes is None and topics is None and regex is None and wildcard is None:
+        prefixes = ["/"]
     _, selector_error = _topic_selector(prefixes, topics, regex, wildcard)
     if selector_error is not None:
         return {
