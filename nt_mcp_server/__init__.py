@@ -148,6 +148,36 @@ OutputMode = Annotated[
         description="summary returns statistics over rows retained after filters and output limits; last_value is the last retained event, not necessarily the value at the end of the window. samples returns timestamp/value rows."
     ),
 ]
+RecordingOutputMode = Annotated[
+    Literal["summary", "samples", "windows", "table"],
+    Field(
+        description="summary returns statistics over retained rows; samples returns timestamp/value rows; windows returns contiguous activity intervals per topic, split when the gap exceeds window_gap_seconds; table resamples selected topics onto one common time grid."
+    ),
+]
+WindowGap = Annotated[
+    float,
+    Field(
+        gt=0,
+        allow_inf_nan=False,
+        description="Maximum quiet gap in seconds between events of the same topic before a new activity window starts.",
+    ),
+]
+TableInterval = Annotated[
+    float,
+    Field(
+        gt=0,
+        allow_inf_nan=False,
+        description="Spacing in seconds of the common time grid used by output='table'.",
+    ),
+]
+TableMaxGap = Annotated[
+    float,
+    Field(
+        ge=0,
+        allow_inf_nan=False,
+        description="Maximum age in seconds of a topic's last sample for output='table'; older values become null.",
+    ),
+]
 RowLimit = Annotated[
     int,
     Field(
@@ -179,19 +209,25 @@ CaptureBudget = Annotated[
     ),
 ]
 StartTime = Annotated[
-    float | None,
+    float | str | None,
     Field(
-        ge=0,
-        allow_inf_nan=False,
-        description="Inclusive event timestamp bound in seconds, using the recording's NT time clock; omitted is unbounded.",
+        description=(
+            "Inclusive lower time bound. Numbers are absolute in the selected "
+            "time_basis. With time_basis='capture', ISO-8601 (for example "
+            "2026-11-04T21:44:40Z) and '+12.5s' (relative to capture start) "
+            "are also accepted; omitted is unbounded."
+        )
     ),
 ]
 EndTime = Annotated[
-    float | None,
+    float | str | None,
     Field(
-        ge=0,
-        allow_inf_nan=False,
-        description="Exclusive event timestamp bound in seconds, using the recording's NT time clock; omitted is unbounded.",
+        description=(
+            "Exclusive upper time bound. Numbers are absolute in the selected "
+            "time_basis. With time_basis='capture', ISO-8601 and '+12.5s' "
+            "(relative to capture start) are also accepted; omitted is "
+            "unbounded."
+        )
     ),
 ]
 LastSeconds = Annotated[
@@ -199,7 +235,19 @@ LastSeconds = Annotated[
     Field(
         gt=0,
         allow_inf_nan=False,
-        description="Most recent N seconds relative to the recording's latest NT event timestamp, not its wall-clock capture end; omitted selects the full time range.",
+        description="Most recent N seconds in the selected time_basis; omitted selects the full time range. The response echoes the resolved window.",
+    ),
+]
+TimeBasis = Annotated[
+    Literal["event", "capture"],
+    Field(
+        description=(
+            "Clock used for start/end/last_seconds. 'event' (default) uses NT "
+            "last-change timestamps, which are not wall-clock time. 'capture' "
+            "uses the recorder's wall-clock per-event capture_time and accepts "
+            "ISO-8601 or '+seconds' bounds; legacy recordings without capture "
+            "metadata are refused."
+        )
     ),
 ]
 
@@ -286,6 +334,10 @@ def _recording_receipt(
         "topics": topic_preview,
         "topics_truncated": len(topics) > len(topic_preview),
         "truncated": recorder.truncated,
+        "label": recorder.label,
+        "idle_stop_seconds": recorder.idle_stop_seconds,
+        "idle_stopped": recorder.idle_stopped,
+        "last_activity_age_seconds": recorder.last_activity_age_seconds,
     }
 
 
@@ -885,6 +937,22 @@ async def nt_start_recording(
     topics: SelectedTopics = None,
     regex: RegexFilter = None,
     wildcard: WildcardFilter = None,
+    label: Annotated[
+        str | None,
+        Field(
+            max_length=200,
+            description="Optional human-readable label stored in the receipt, metadata sidecar and recording listings.",
+        ),
+    ] = None,
+    idle_stop_seconds: Annotated[
+        float | None,
+        Field(
+            gt=0,
+            le=3600,
+            allow_inf_nan=False,
+            description="Optional auto-stop after this many seconds with no recorded event; useful for unattended test windows.",
+        ),
+    ] = None,
 ) -> dict:
     """Start an NDJSON recording and return its id immediately.
 
@@ -894,11 +962,17 @@ async def nt_start_recording(
     Records the same initial values and incoming updates as ``nt_sample``;
     it does not periodically read unchanged values. ``sample_interval``
     filters received events rather than generating periodic readings.
-    Selector kinds are ANDed; list entries ORed. ``nt_sample`` returns a
-    fixed window inline; ``nt_start_subscription`` buffers events for polling.
+    Selector kinds are ANDed; list entries ORed. With no selectors, records
+    every topic (equivalent to ``prefixes=["/"]``). ``label`` is echoed by
+    receipts and recordings; ``idle_stop_seconds`` ends capture after a
+    quiet period so a forgotten stop does not inflate the file.
+    ``nt_sample`` returns a fixed window inline; ``nt_start_subscription``
+    buffers events for polling.
     """
     if not manager.is_connected():
         return {"connected": False, "error": "NT server disconnected"}
+    if prefixes is None and topics is None and regex is None and wildcard is None:
+        prefixes = ["/"]
     _, selector_error = _topic_selector(prefixes, topics, regex, wildcard)
     if selector_error is not None:
         return {
@@ -920,6 +994,8 @@ async def nt_start_recording(
         topics=topics,
         regex=regex,
         wildcard=wildcard,
+        label=label,
+        idle_stop_seconds=idle_stop_seconds,
     )
     task = asyncio.create_task(recorder.run())
     _recorders[recording_id] = recorder
@@ -940,6 +1016,8 @@ async def nt_start_recording(
         "recording_id": recording_id,
         "path": os.path.join(dir_, recording_id),
         "started": True,
+        "label": label,
+        "idle_stop_seconds": idle_stop_seconds,
     }
     if recorder.capture_started_at is not None:
         response["capture_started_at"] = recorder.capture_started_at
@@ -959,8 +1037,11 @@ async def nt_start_recording(
 async def nt_stop_recording(recording_id: RecordingId) -> dict:
     """Stop a nonblocking recording and return its compact file receipt.
 
-    Timing and counts describe the full capture. ``topics`` previews at most
-    five names within 500 serialized characters; ``topics_truncated`` marks
+    Timing and counts describe the full capture. ``label``, ``idle_stopped``,
+    ``idle_stop_seconds`` and ``last_activity_age_seconds`` report the
+    recording label and whether an idle timeout ended capture, plus how long
+    the file was quiet before it closed. ``topics`` previews at most five
+    names within 500 serialized characters; ``topics_truncated`` marks
     omitted names, independently of the captured-row ``truncated`` flag.
     Use ``nt_get_recording_info`` with this ``recording_id`` and optional
     topic filters for bounded discovery of the recorded topics.
@@ -1036,6 +1117,12 @@ def nt_get_recording_info(
             description="Maximum topic names returned, from 1 to 1000; metadata counts describe the full recording.",
         ),
     ] = 100,
+    include_activity: Annotated[
+        bool,
+        Field(
+            description="Add per-topic timing for returned topics: first_time, last_time, span_seconds, mean_interval_seconds, effective_hz, max_gap_seconds and last_change_age_seconds (relative to the recording's latest event). Defaults to False."
+        ),
+    ] = False,
 ) -> dict:
     """Return metadata and a bounded, filterable topic list for a recording.
 
@@ -1045,6 +1132,9 @@ def nt_get_recording_info(
     ``topic_count`` describes the whole file; ``matching_topic_count``
     describes names matching all filters. ``topics_returned`` and
     ``topics_truncated`` report clipping of the sorted topic list.
+    ``include_activity=True`` adds a bounded ``activity`` map for the same
+    returned topics; its ``effective_hz`` and ``max_gap_seconds`` reveal
+    change-driven gaps and the real telemetry rate.
     ``nt_query_recording`` returns values; ``nt_list_recordings`` finds files.
     """
     dir_ = output_dir or os.environ.get("NT_RECORDINGS_DIR", "./recordings")
@@ -1053,14 +1143,24 @@ def nt_get_recording_info(
         return {"recording_id": recording_id, "error": error}
     try:
         result = nt_recorder.get_recording_info(
-            recording_id, dir_, prefix, regex, wildcard, topic_limit
+            recording_id,
+            dir_,
+            prefix,
+            regex,
+            wildcard,
+            topic_limit,
+            include_activity,
         )
     except ValueError as exc:
         return {"error": str(exc)}
     while result["topics"] and len(json.dumps(result)) > _MAX_RESPONSE_CHARS:
-        result["topics"].pop()
+        removed = result["topics"].pop()
         result["topics_returned"] = len(result["topics"])
         result["topics_truncated"] = True
+        if "activity" in result:
+            result["activity"].pop(removed, None)
+            result["activity_returned"] = len(result["activity"])
+            result["activity_truncated"] = True
     return result
 
 
@@ -1082,30 +1182,62 @@ def nt_query_recording(
     limit: RowLimit = 1000,
     max_rows: RowBudget = 5000,
     sample_interval: SampleInterval = None,
-    output: OutputMode = "samples",
+    output: RecordingOutputMode = "samples",
     output_dir: RecordingDirectory = None,
     topics: SelectedTopics = None,
     regex: RegexFilter = None,
     wildcard: WildcardFilter = None,
+    time_basis: TimeBasis = "event",
+    window_gap_seconds: WindowGap = 1.0,
+    table_interval_seconds: TableInterval = 0.1,
+    table_max_gap_seconds: TableMaxGap = 1.0,
 ) -> dict:
     """Return selected events from a recording.
 
     ``prefixes`` and exact ``topics`` are ORed within their lists; selector
     kinds are ANDed. ``regex`` and ``wildcard`` match full topic names.
 
-    ``last_seconds`` selects the most recent N seconds. ``sample_interval``
-    decimates per-topic events before row limits; it does not generate
-    regularly spaced samples. ``output="summary"`` returns min/max/mean/last
-    over rows retained after filtering and output limits. ``last_value``
-    is the last retained event, which may precede the end of the selected
-    window. ``limit`` caps entries per topic and
+    ``last_seconds`` selects the most recent N seconds in ``time_basis``.
+    ``time_basis="event"`` (default) uses NT last-change timestamps;
+    ``time_basis="capture"`` uses the recorder's wall-clock per-event
+    ``capture_time`` and accepts ISO-8601 or ``+seconds`` bounds relative
+    to capture start. Legacy recordings without capture metadata are
+    refused for capture-basis queries. Every successful response echoes the
+    resolved ``window``.
+
+    ``sample_interval`` decimates per-topic events before row limits; it
+    does not generate regularly spaced samples. ``output="summary"`` returns
+    statistics over rows retained after filtering and output limits, with
+    value ``std`` and timing ``effective_hz``, ``max_gap_seconds`` and
+    ``span_seconds``. ``last_value`` is the last retained event, which may
+    precede the end of the selected window. ``output="windows"`` returns
+    contiguous activity intervals per topic, splitting when the quiet gap
+    exceeds ``window_gap_seconds``; each window reports ``start``, ``end``,
+    ``duration_seconds``, ``samples`` and ``mean_interval_seconds``.
+    ``output="table"`` resamples selected topics onto a common grid spaced
+    by ``table_interval_seconds``; each row is
+    ``{"time": t, "values": {topic: value | null}}`` and a topic's last
+    sample is reused only within ``table_max_gap_seconds``.
+    ``limit`` caps entries per topic (windows in window mode) and
     ``max_rows`` caps the total across topics; the response always states
     ``rows``, ``total_rows`` and ``truncated`` so clipping is never silent.
     A bare ``"/"`` prefix is refused; ``nt_get_recording_info`` discovers
-    topic names for a narrower query. A final
-    character ceiling keeps the whole response under 60,000 serialized
-    characters; any rows it drops set ``truncated: True``.
+    topic names for a narrower query. A final character ceiling keeps the
+    whole response under 60,000 serialized characters; any rows it drops
+    set ``truncated: True``.
     """
+    if output not in ("summary", "samples", "windows", "table"):
+        return {
+            "recording_id": recording_id,
+            "output": output,
+            "error": (
+                f"unknown output mode {output!r}; valid modes: "
+                "'summary', 'samples', 'windows', 'table'"
+            ),
+            "rows": 0,
+            "total_rows": 0,
+            "truncated": False,
+        }
     selector, selector_error = _topic_selector(prefixes, topics, regex, wildcard)
     if selector_error is not None:
         return {
@@ -1139,6 +1271,95 @@ def nt_query_recording(
             "total_rows": 0,
             "truncated": False,
         }
+    try:
+        window = nt_recorder.describe_window(
+            recording_id=recording_id,
+            output_dir=dir_,
+            start=start,
+            end=end,
+            last_seconds=last_seconds,
+            time_basis=time_basis,
+        )
+    except ValueError as exc:
+        return {
+            "recording_id": recording_id,
+            "error": str(exc),
+            "topics": {},
+            "rows": 0,
+            "total_rows": 0,
+            "truncated": False,
+        }
+    if output == "table":
+        try:
+            table = nt_recorder.build_table(
+                prefixes=prefixes,
+                recording_id=recording_id,
+                output_dir=dir_,
+                start=start,
+                end=end,
+                last_seconds=last_seconds,
+                limit=limit,
+                sample_interval=sample_interval,
+                topics=topics,
+                regex=regex,
+                wildcard=wildcard,
+                interval_seconds=table_interval_seconds,
+                max_gap_seconds=table_max_gap_seconds,
+                max_rows=max_rows,
+                time_basis=time_basis,
+            )
+        except ValueError as exc:
+            return {
+                "recording_id": recording_id,
+                "error": str(exc),
+                "columns": [],
+                "table": [],
+                "rows": 0,
+                "total_rows": 0,
+                "truncated": False,
+            }
+        return enforce_max_chars(
+            {
+                "recording_id": recording_id,
+                "window": window,
+                "columns": table["columns"],
+                "table": table["table"],
+                "rows": len(table["table"]),
+                "total_rows": table["total_rows"],
+                "truncated": table["truncated"],
+                "interval_seconds": table["interval_seconds"],
+                "max_gap_seconds": table["max_gap_seconds"],
+            },
+            "table",
+            _MAX_RESPONSE_CHARS,
+        )
+    if output == "windows":
+        windows = nt_recorder.get_windows(
+            prefixes=prefixes,
+            recording_id=recording_id,
+            output_dir=dir_,
+            start=start,
+            end=end,
+            last_seconds=last_seconds,
+            limit=limit,
+            topics=topics,
+            regex=regex,
+            wildcard=wildcard,
+            gap_seconds=window_gap_seconds,
+            time_basis=time_basis,
+        )
+        total_rows = sum(len(items) for items in windows.values())
+        return _bounded_events(
+            {
+                "recording_id": recording_id,
+                "window": window,
+                "topics": windows,
+                "total_rows": total_rows,
+            },
+            "topics",
+            "windows",
+            max_rows,
+        )
     result = nt_recorder.subscribe_offline(
         prefixes=prefixes,
         recording_id=recording_id,
@@ -1153,10 +1374,12 @@ def nt_query_recording(
         topics=topics,
         regex=regex,
         wildcard=wildcard,
+        time_basis=time_basis,
     )
     return _bounded_events(
         {
             "recording_id": recording_id,
+            "window": result["window"],
             "topics": result["topics"],
             "total_rows": result["total_rows"],
         },

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import math
 import re
 from typing import Any, Literal
 
@@ -150,8 +151,12 @@ def _all_numeric(values: list[Any]) -> bool:
 def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
     """Return a summary dict for a list of ``{"time": float, "value": ...}`` samples.
 
-    Always includes ``count``, ``last_value`` and ``last_time``. If every
-    value is a numeric scalar, also includes ``min``, ``max`` and ``mean``.
+    Always includes ``count``, ``last_value`` and ``last_time``. Timing
+    fields (``first_time``, ``min_time``, ``max_time``, ``span_seconds``,
+    ``mean_interval_seconds``, ``effective_hz``, ``max_gap_seconds``) use
+    positive timestamps and expose change-driven gaps and the real rate.
+    If every value is a numeric scalar, also includes ``min``, ``max``,
+    ``mean`` and population ``std``.
     """
     if not samples:
         return {"count": 0}
@@ -162,11 +167,44 @@ def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "last_value": last["value"],
         "last_time": last["time"],
     }
+    times = sorted(
+        float(sample["time"])
+        for sample in samples
+        if isinstance(sample.get("time"), (int, float))
+        and not isinstance(sample.get("time"), bool)
+        and sample["time"] > 0
+    )
+    if times:
+        first_time = times[0]
+        max_time = times[-1]
+        span = max_time - first_time
+        gaps = [later - earlier for earlier, later in zip(times, times[1:])]
+        summary.update(
+            {
+                "first_time": first_time,
+                "min_time": first_time,
+                "max_time": max_time,
+                "span_seconds": span,
+                "mean_interval_seconds": (
+                    span / (len(times) - 1) if len(times) > 1 else None
+                ),
+                "effective_hz": (
+                    (len(times) - 1) / span if len(times) > 1 and span > 0 else None
+                ),
+                "max_gap_seconds": max(gaps) if gaps else 0.0,
+            }
+        )
     if _all_numeric(values):
         nums = [float(v) for v in values]
+        mean = sum(nums) / len(nums)
         summary["min"] = min(nums)
         summary["max"] = max(nums)
-        summary["mean"] = sum(nums) / len(nums)
+        summary["mean"] = mean
+        summary["std"] = (
+            math.sqrt(sum((value - mean) ** 2 for value in nums) / len(nums))
+            if len(nums) > 1
+            else 0.0
+        )
     return summary
 
 

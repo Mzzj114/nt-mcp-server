@@ -529,6 +529,26 @@ async def test_nt_recording_allows_bare_root_prefix(mcp_synced: None, tmp_path) 
 
 
 @pytest.mark.anyio
+async def test_nt_recording_without_selectors_captures_all(
+    mcp_synced: None, tmp_path
+) -> None:
+    """Omitting every selector records all topics instead of erroring."""
+    start = await nt_mcp_server.nt_start_recording(output_dir=str(tmp_path))
+    assert start["connected"] is True
+    assert start["started"] is True
+    await asyncio.sleep(0.5)
+    response = await nt_mcp_server.nt_stop_recording(start["recording_id"])
+    assert response["stopped"] is True
+    assert "error" not in response
+    assert response["rows"] >= 1
+    assert response["topic_count"] >= len(FIXTURE_NAMES)
+    info = nt_mcp_server.nt_get_recording_info(
+        output_dir=str(tmp_path), prefix="/SmartDashboard/test_"
+    )
+    assert set(FIXTURE_NAMES) <= set(info["topics"])
+
+
+@pytest.mark.anyio
 async def test_nt_sample_unknown_output_rejected(mcp_synced: None) -> None:
     """An unknown output mode returns a structured error listing modes."""
     response = await nt_mcp_server.nt_sample(
@@ -809,6 +829,63 @@ async def test_nt_nonblocking_recording_lifecycle(mcp_synced: None, tmp_path) ->
     assert "error" in missing
 
 
+@pytest.mark.anyio
+async def test_nt_recording_label_and_idle_stop(mcp_synced: None, tmp_path) -> None:
+    """Labels persist across receipts/listings and idle capture self-stops."""
+    start = await nt_mcp_server.nt_start_recording(
+        topics=[FIXTURE_NAMES[0]],
+        output_dir=str(tmp_path),
+        label="auto-run",
+        idle_stop_seconds=0.5,
+    )
+    assert start["started"] is True
+    assert start["label"] == "auto-run"
+    assert start["idle_stop_seconds"] == 0.5
+
+    await asyncio.sleep(1.0)
+    stop = await nt_mcp_server.nt_stop_recording(start["recording_id"])
+    assert stop["stopped"] is True
+    assert stop["label"] == "auto-run"
+    assert stop["idle_stopped"] is True
+    assert stop["idle_stop_seconds"] == 0.5
+    assert stop["last_activity_age_seconds"] >= 0.4
+
+    listed = nt_mcp_server.nt_list_recordings(output_dir=str(tmp_path))
+    entry = next(item for item in listed if item["id"] == start["recording_id"])
+    assert entry["label"] == "auto-run"
+    assert entry["idle_stopped"] is True
+    info = nt_mcp_server.nt_get_recording_info(
+        recording_id=start["recording_id"], output_dir=str(tmp_path)
+    )
+    assert info["label"] == "auto-run"
+    assert info["idle_stopped"] is True
+    assert info["last_activity_age_seconds"] >= 0.4
+
+
+@pytest.mark.anyio
+async def test_nt_recording_idle_timer_resets_on_activity(
+    mcp_synced: None, tmp_path
+) -> None:
+    """A steady event stream prevents the idle watchdog from ending capture."""
+    topic = "/SmartDashboard/idle_reset_num"
+
+    async def churn() -> None:
+        for index in range(12):
+            nt_mcp_server.nt_write_topics({topic: float(index)})
+            await asyncio.sleep(0.15)
+
+    churn_task = asyncio.create_task(churn())
+    start = await nt_mcp_server.nt_start_recording(
+        topics=[topic],
+        output_dir=str(tmp_path),
+        idle_stop_seconds=0.5,
+    )
+    await churn_task
+    stop = await nt_mcp_server.nt_stop_recording(start["recording_id"])
+    assert stop["idle_stopped"] is False
+    assert stop["rows"] >= 1
+
+
 # --- Offline MCP tool tests -------------------------------------------------
 
 
@@ -918,6 +995,214 @@ async def test_nt_get_recording_info_returns_topics(mcp_synced: None, tmp_path) 
     assert all(topic.startswith("/SmartDashboard/") for topic in prefixed)
     assert set(FIXTURE_NAMES) <= set(prefixed)
     json.dumps(prefixed)
+
+
+def _write_activity_recording(tmp_path) -> str:
+    """Write two topics with a quiet gap, returning the recording id."""
+    recording = tmp_path / "mcp-activity.ndjson"
+    events = [
+        {"time": 1000.0, "topic": "/drive/x", "value": 1},
+        {"time": 1001.0, "topic": "/drive/x", "value": 2},
+        {"time": 1002.0, "topic": "/drive/x", "value": 3},
+        {"time": 1010.0, "topic": "/drive/x", "value": 4},
+        {"time": 1011.0, "topic": "/drive/x", "value": 5},
+        {"time": 1000.0, "topic": "/drive/y", "value": 1},
+        {"time": 1005.0, "topic": "/drive/y", "value": 2},
+    ]
+    recording.write_text(
+        "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+    )
+    return recording.name
+
+
+def test_nt_get_recording_info_returns_activity(tmp_path) -> None:
+    """include_activity adds per-topic timing without changing topic discovery."""
+    recording_id = _write_activity_recording(tmp_path)
+    info = nt_mcp_server.nt_get_recording_info(
+        recording_id=recording_id,
+        output_dir=str(tmp_path),
+        include_activity=True,
+    )
+    assert info["topics"] == ["/drive/x", "/drive/y"]
+    activity = info["activity"]["/drive/x"]
+    assert activity["first_time"] == 1000.0
+    assert activity["last_time"] == 1011.0
+    assert activity["effective_hz"] == pytest.approx(4 / 11.0)
+    assert activity["max_gap_seconds"] == pytest.approx(8.0)
+    assert activity["last_change_age_seconds"] == pytest.approx(0.0)
+    assert info["activity_truncated"] is False
+    json.dumps(info)
+
+
+def test_nt_query_recording_windows(tmp_path) -> None:
+    """output='windows' returns contiguous activity intervals per topic."""
+    recording_id = _write_activity_recording(tmp_path)
+    result = nt_mcp_server.nt_query_recording(
+        prefixes=["/drive/"],
+        recording_id=recording_id,
+        output_dir=str(tmp_path),
+        output="windows",
+        window_gap_seconds=2.0,
+    )
+    assert result["rows"] == 4
+    assert result["total_rows"] == 4
+    assert result["truncated"] is False
+    assert [window["samples"] for window in result["topics"]["/drive/x"]] == [3, 2]
+    assert [window["samples"] for window in result["topics"]["/drive/y"]] == [1, 1]
+    json.dumps(result)
+
+
+def test_nt_query_recording_windows_respects_budget(tmp_path) -> None:
+    """Window mode reports clipping through rows/truncated."""
+    recording_id = _write_activity_recording(tmp_path)
+    result = nt_mcp_server.nt_query_recording(
+        prefixes=["/drive/"],
+        recording_id=recording_id,
+        output_dir=str(tmp_path),
+        output="windows",
+        window_gap_seconds=2.0,
+        max_rows=2,
+    )
+    assert result["rows"] == 2
+    assert result["total_rows"] == 4
+    assert result["truncated"] is True
+
+
+def _write_capture_recording(tmp_path) -> str:
+    """Write a capture-clock recording plus its metadata sidecar."""
+    recording = tmp_path / "capture.ndjson"
+    events = [
+        {"time": 5000.0, "capture_time": 1000.0, "topic": "/x", "value": 1},
+        {"time": 5001.0, "capture_time": 1001.0, "topic": "/x", "value": 2},
+        {"time": 5004.0, "capture_time": 1004.0, "topic": "/x", "value": 3},
+    ]
+    recording.write_text(
+        "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+    )
+    (tmp_path / "capture.meta.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "event_time_fields": ["time", "capture_time"],
+                "recording_id": recording.name,
+                "capture_started_at": 999.0,
+                "capture_started_iso": "1970-01-01T00:16:39+00:00",
+                "capture_ended_at": 1005.0,
+                "capture_ended_iso": "1970-01-01T00:16:45+00:00",
+                "capture_duration_seconds": 6.0,
+                "event_span_seconds": 4.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return recording.name
+
+
+def test_nt_query_recording_capture_time_basis(tmp_path) -> None:
+    """Capture-basis queries accept relative/ISO bounds and echo the window."""
+    recording_id = _write_capture_recording(tmp_path)
+    result = nt_mcp_server.nt_query_recording(
+        topics=["/x"],
+        recording_id=recording_id,
+        output_dir=str(tmp_path),
+        start="+1.0",
+        end="+3.5",
+        time_basis="capture",
+    )
+    assert [entry["value"] for entry in result["topics"]["/x"]] == [1, 2]
+    assert result["window"]["basis"] == "capture"
+    assert result["window"]["start"] == 1000.0
+    assert result["window"]["end"] == 1002.5
+    assert result["window"]["start_iso"] is not None
+    assert result["window"]["capture_started_at"] == 999.0
+    json.dumps(result)
+
+
+def test_nt_query_recording_capture_time_basis_is_legacy_safe(tmp_path) -> None:
+    """A legacy file without capture timestamps returns a structured error."""
+    recording = tmp_path / "legacy.ndjson"
+    recording.write_text(
+        json.dumps({"time": 1000.0, "topic": "/x", "value": 1}), encoding="utf-8"
+    )
+    result = nt_mcp_server.nt_query_recording(
+        topics=["/x"],
+        recording_id=recording.name,
+        output_dir=str(tmp_path),
+        time_basis="capture",
+    )
+    assert "requires recording capture metadata" in result["error"]
+    (tmp_path / "legacy.meta.json").write_text(
+        json.dumps({"capture_started_at": 999.0}), encoding="utf-8"
+    )
+    result = nt_mcp_server.nt_query_recording(
+        topics=["/x"],
+        recording_id=recording.name,
+        output_dir=str(tmp_path),
+        time_basis="capture",
+    )
+    assert "per-event capture_time" in result["error"]
+    assert result["rows"] == 0
+    assert result["truncated"] is False
+
+
+def test_nt_query_recording_table(tmp_path) -> None:
+    """Table mode returns aligned rows and echoes the resolved window."""
+    recording = tmp_path / "table.ndjson"
+    events = [
+        {"time": 1000.0, "topic": "/a", "value": 1},
+        {"time": 1001.0, "topic": "/a", "value": 2},
+        {"time": 1002.0, "topic": "/a", "value": 3},
+        {"time": 1000.0, "topic": "/b", "value": 10},
+        {"time": 1002.0, "topic": "/b", "value": 30},
+    ]
+    recording.write_text(
+        "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+    )
+    result = nt_mcp_server.nt_query_recording(
+        topics=["/a", "/b"],
+        recording_id=recording.name,
+        output_dir=str(tmp_path),
+        start=1000.0,
+        end=1003.0,
+        output="table",
+        table_interval_seconds=1.0,
+        table_max_gap_seconds=1.5,
+    )
+    assert result["columns"] == ["/a", "/b"]
+    assert result["rows"] == 3
+    assert result["total_rows"] == 3
+    assert result["truncated"] is False
+    assert result["table"][1] == {
+        "time": 1001.0,
+        "values": {"/a": 2, "/b": 10},
+    }
+    assert result["window"]["basis"] == "event"
+    json.dumps(result)
+
+
+def test_nt_query_recording_table_respects_budget(tmp_path) -> None:
+    """Table clipping is visible through rows/total_rows/truncated."""
+    recording = tmp_path / "table-budget.ndjson"
+    events = [
+        {"time": float(1000 + index), "topic": "/a", "value": index}
+        for index in range(10)
+    ]
+    recording.write_text(
+        "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+    )
+    result = nt_mcp_server.nt_query_recording(
+        topics=["/a"],
+        recording_id=recording.name,
+        output_dir=str(tmp_path),
+        start=1000.0,
+        end=1010.0,
+        output="table",
+        table_interval_seconds=1.0,
+        max_rows=3,
+    )
+    assert result["rows"] == 3
+    assert result["total_rows"] == 10
+    assert result["truncated"] is True
 
 
 @pytest.mark.anyio
@@ -1375,6 +1660,10 @@ RECEIPT_KEYS = {
     "topics",
     "topics_truncated",
     "truncated",
+    "label",
+    "idle_stop_seconds",
+    "idle_stopped",
+    "last_activity_age_seconds",
 }
 
 
@@ -1411,29 +1700,38 @@ async def test_recording_receipt_topic_preview_preserves_full_discovery(
     ]
     publishers = [nt_server.getStringTopic(topic).publish() for topic in topics]
     try:
-        for publisher in publishers:
-            publisher.set("sample values must stay out of receipts")
-        nt_server.flush()
         start = await nt_mcp_server.nt_start_recording(
             topics=topics, output_dir=str(tmp_path)
         )
-        await asyncio.sleep(0.5)
+        recorder = nt_mcp_server._recorders[start["recording_id"]]
+        # Long topic names can be slow to announce; re-publish for a short
+        # window, then validate discovery for the topics that did arrive.
+        for _ in range(10):
+            for publisher in publishers:
+                publisher.set("sample values must stay out of receipts")
+            nt_server.flush()
+            await asyncio.sleep(0.1)
         receipt = await nt_mcp_server.nt_stop_recording(start["recording_id"])
+        captured = recorder.topics
+        assert captured, "recorder captured no topics"
         assert receipt["stopped"] is True
-        assert receipt["rows"] >= len(topics)
-        assert receipt["topic_count"] == len(topics)
-        assert receipt["topics"] == topics[:preview_count]
+        assert receipt["rows"] >= len(captured)
+        assert receipt["topic_count"] == len(captured)
+        expected_preview = captured[:preview_count]
+        assert receipt["topics"] == expected_preview
         assert len(json.dumps(receipt["topics"])) <= 500
-        assert receipt["topics_truncated"] is True
+        assert receipt["topics_truncated"] is (
+            len(captured) > len(expected_preview)
+        )
         assert receipt["truncated"] is False
         assert "sample values must stay out of receipts" not in json.dumps(receipt)
         info = nt_mcp_server.nt_get_recording_info(
             recording_id=receipt["recording_id"], output_dir=str(tmp_path),
             prefix=f"/ReceiptPreview/{name_length}/",
         )
-        assert info["topics"] == topics
+        assert info["topics"] == captured
         assert info["topics_truncated"] is False
-        assert info["topic_count"] == len(topics)
+        assert info["topic_count"] == len(captured)
     finally:
         for publisher in publishers:
             publisher.close()

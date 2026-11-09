@@ -78,10 +78,10 @@ The server exposes 16 tools (13 live + 3 offline). Every live response includes 
 | `nt_start_subscription` | Start a persistent in-memory subscription and return its `subscription_id`. `buffer_size` bounds retained events; oldest events are discarded when full.                                                                                                                  |
 | `nt_poll_subscription`  | Read buffered events; `clear=True` clears them after polling.                                                                                                                                                                                                             |
 | `nt_stop_subscription`  | Stop the subscription and free its resources.                                                                                                                                                                                                                             |
-| `nt_start_recording`    | Start an NDJSON recording and immediately return its `recording_id` and path for a human-controlled test window.                                                                                                                                                          |
-| `nt_stop_recording`     | Close a recording and return a compact receipt with timing, row count, topic names and truncation flags, without sample values.                                                                                                                                           |
+| `nt_start_recording`    | Start an NDJSON recording and immediately return its `recording_id` and path for a human-controlled test window. With no selectors it records every topic. Optional `label` is echoed by receipts and listings; `idle_stop_seconds` ends capture after a quiet period.                                                                        |
+| `nt_stop_recording`     | Close a recording and return a compact receipt with timing, row count, topic names, label, idle-stop state and truncation flags, without sample values.                                                                                                                                                                                    |
 
-Live sampling, subscriptions, recordings and recording queries share `prefixes`, exact `topics`, `regex` and `wildcard` selectors. Entries within a list are ORed; different selector kinds are ANDed. At least one selector is required. A bare `prefixes=["/"]` is allowed for recordings, but refused for inline sampling and recording queries unless another selector narrows it.
+Live sampling, subscriptions, recordings and recording queries share `prefixes`, exact `topics`, `regex` and `wildcard` selectors. Entries within a list are ORed; different selector kinds are ANDed. At least one selector is required for inline sampling, subscriptions and queries; `nt_start_recording` with no selectors captures every topic. A bare `prefixes=["/"]` is allowed for recordings, but refused for inline sampling and recording queries unless another selector narrows it.
 
 `nt_sample` blocks for its fixed window and returns inline results. For an interactive test, call `nt_start_recording`, perform the test, then call `nt_stop_recording`. Use the returned ID for offline analysis after the file closes.
 
@@ -143,9 +143,9 @@ it does not acknowledge execution of a command sent through another topic.
 
 | Tool                    | Description                                                                                                                                                                                                                                                                                                                      |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `nt_list_recordings`    | List available files, newest first, with file metadata and persisted capture timing when available.                                                                                                                                                                                                                              |
-| `nt_get_recording_info` | Return capture duration, NT event span, sample count, file metadata and a sorted topic list. `prefix`, `regex` and `wildcard` filter topic discovery; `topic_limit` defaults to 100 (maximum 1000). `topic_count` describes the whole file; `matching_topic_count`, `topics_returned` and `topics_truncated` describe discovery. |
-| `nt_query_recording`    | Query selected topics. Returns `{recording_id, topics, rows, total_rows, truncated}`. Defaults to `output="samples"`; `output="summary"` returns statistics under the same `topics` key. Supports `start` (inclusive), `end` (exclusive), `last_seconds` and `sample_interval`.                                                  |
+| `nt_list_recordings`    | List available files, newest first, with file metadata, capture timing and the recording `label` when present.                                                                                                                                                                                                                   |
+| `nt_get_recording_info` | Return capture duration, NT event span, sample count, file metadata and a sorted topic list. `prefix`, `regex` and `wildcard` filter topic discovery; `topic_limit` defaults to 100 (maximum 1000). `topic_count` describes the whole file; `matching_topic_count`, `topics_returned` and `topics_truncated` describe discovery. `include_activity=True` adds per-topic `first_time`, `last_time`, `effective_hz`, `max_gap_seconds` and `last_change_age_seconds`. |
+| `nt_query_recording`    | Query selected topics. Returns `{recording_id, window, topics, rows, total_rows, truncated}`. Outputs: `samples`, `summary`, `windows` (contiguous activity intervals) and `table` (one common time grid). Supports `start` (inclusive), `end` (exclusive), `last_seconds`, `sample_interval` and `time_basis="event"|"capture"`. |
 
 The offline directory defaults to `NT_RECORDINGS_DIR` or `./recordings`; `output_dir` overrides it. Omitting `recording_id` selects the most recently modified recording. Queries return the resolved ID. The MCP tools refuse to inspect a recording still being written by this server; a separate CLI recorder must also be stopped before analysis.
 
@@ -160,9 +160,11 @@ nt_query_recording(
 )
 ```
 
-Inline sampling and offline queries are bounded by per-topic `limit`, total `max_rows` (default 5000, maximum 5000) and a 60,000-character ceiling. Summary statistics describe retained rows; `rows` / `total_rows` / `truncated` report reduction explicitly. Offline `total_rows` counts matching events before limits and decimation; live `total_rows` counts events after sampling/change filters and before output clipping. `last_seconds` uses the latest NT event timestamp, which can differ from the capture clock.
+Inline sampling and offline queries are bounded by per-topic `limit`, total `max_rows` (default 5000, maximum 5000) and a 60,000-character ceiling. Summary statistics describe retained rows and include `std`, `span_seconds`, `effective_hz` and `max_gap_seconds`; `rows` / `total_rows` / `truncated` report reduction explicitly. Offline `total_rows` counts matching events before limits and decimation; live `total_rows` counts events after sampling/change filters and before output clipping.
 
-Each new recording has a sibling `.meta.json` sidecar. `capture_duration_seconds` measures capture time; `event_span_seconds` measures the range of NT last-change timestamps, including older immediate values. Legacy files without sidecars report `duration_source="event_span"`.
+`time_basis="event"` (default) filters on NT last-change timestamps, which are not wall-clock time. `time_basis="capture"` filters on the recorder's `capture_time` and accepts ISO-8601 or `+12.5s` bounds relative to capture start; legacy recordings without capture metadata are refused. Every query echoes the resolved `window`, including the data bounds and capture timestamps. `output="windows"` splits a topic's activity when the quiet gap exceeds `window_gap_seconds`; `output="table"` resamples on `table_interval_seconds` and only reuses a topic value within `table_max_gap_seconds`.
+
+Each new recording has a sibling `.meta.json` sidecar. `capture_duration_seconds` measures capture time; `event_span_seconds` measures the range of NT last-change timestamps, including older immediate values. New NDJSON events also carry a wall-clock `capture_time`. Legacy files without sidecars report `duration_source="event_span"` and support only `time_basis="event"`. Optional recording `label` and idle-stop fields are persisted in the sidecar.
 
 The `nt-recorder` CLI remains available independently of MCP, including `--team N` for robot address lookup. Recordings are local to the server host; no robot-side changes are needed.
 
@@ -194,6 +196,14 @@ Then use `nt_connect` with its defaults to connect to `127.0.0.1:5810`.
 For a real robot, connect the development machine to the robot network and call `nt_connect` with `team_number`. If the agent also needs Internet access, use separate network adapters—for example, Wi-Fi for Internet and Ethernet or a USB network adapter for the robot—and configure routing if needed.
 
 ## Release notes
+
+### Unreleased — recording ergonomics
+
+- `nt_start_recording` without selectors records every topic, accepts a `label`, and can auto-stop after `idle_stop_seconds` without a recorded event.
+- `nt_stop_recording`, `nt_list_recordings` and `nt_get_recording_info` surface the label, idle-stop state and `last_activity_age_seconds`.
+- `nt_get_recording_info(include_activity=True)` reports per-topic `first_time`, `last_time`, `span_seconds`, `mean_interval_seconds`, `effective_hz`, `max_gap_seconds` and `last_change_age_seconds`.
+- `nt_query_recording` adds `output="windows"` and `output="table"`, `time_basis="event"|"capture"`, ISO-8601/`+seconds` bounds, and echoes the resolved `window`.
+- New recordings write per-event `capture_time`; summaries add `std`, `span_seconds`, `effective_hz` and `max_gap_seconds`.
 
 ### 0.3.0 — consolidated tool surface
 
