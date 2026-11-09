@@ -458,6 +458,93 @@ def _write_capture_recording(tmp_path) -> str:
     return recording.name
 
 
+def test_reader_summary_reports_rate_gaps_and_std(tmp_path) -> None:
+    """Summary statistics expose timing, effective rate and population std."""
+    recording_id = _write_activity_recording(tmp_path)
+    result = nt_recorder.subscribe_offline(
+        topics=["/drive/x"],
+        recording_id=recording_id,
+        output_dir=str(tmp_path),
+        format="summary",
+    )
+    summary = result["/drive/x"]
+    assert summary["count"] == 5
+    assert summary["first_time"] == 1000.0
+    assert summary["min_time"] == 1000.0
+    assert summary["max_time"] == 1011.0
+    assert summary["span_seconds"] == pytest.approx(11.0)
+    assert summary["mean_interval_seconds"] == pytest.approx(11.0 / 4)
+    assert summary["effective_hz"] == pytest.approx(4 / 11.0)
+    assert summary["max_gap_seconds"] == pytest.approx(8.0)
+    assert summary["std"] == pytest.approx(2 ** 0.5)
+
+
+def test_build_table_aligns_topics_on_common_grid(tmp_path) -> None:
+    """Table mode forward-fills each topic and emits null past max_gap."""
+    recording = tmp_path / "table.ndjson"
+    events = [
+        {"time": 1000.0, "topic": "/a", "value": 1},
+        {"time": 1001.0, "topic": "/a", "value": 2},
+        {"time": 1002.0, "topic": "/a", "value": 3},
+        {"time": 1000.0, "topic": "/b", "value": 10},
+        {"time": 1002.0, "topic": "/b", "value": 30},
+    ]
+    recording.write_text(
+        "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+    )
+    table = nt_recorder.build_table(
+        topics=["/a", "/b"],
+        recording_id=recording.name,
+        output_dir=str(tmp_path),
+        start=1000.0,
+        end=1003.0,
+        interval_seconds=1.0,
+        max_gap_seconds=1.5,
+    )
+    assert table["columns"] == ["/a", "/b"]
+    assert table["total_rows"] == 3
+    assert table["truncated"] is False
+    assert table["table"] == [
+        {"time": 1000.0, "values": {"/a": 1, "/b": 10}},
+        {"time": 1001.0, "values": {"/a": 2, "/b": 10}},
+        {"time": 1002.0, "values": {"/a": 3, "/b": 30}},
+    ]
+    strict = nt_recorder.build_table(
+        topics=["/a", "/b"],
+        recording_id=recording.name,
+        output_dir=str(tmp_path),
+        start=1000.0,
+        end=1003.0,
+        interval_seconds=1.0,
+        max_gap_seconds=0.5,
+    )
+    assert strict["table"][1]["values"]["/b"] is None
+
+
+def test_build_table_reports_row_budget_clipping(tmp_path) -> None:
+    """max_rows caps built grid rows while total_rows stays truthful."""
+    recording = tmp_path / "table-budget.ndjson"
+    events = [
+        {"time": float(1000 + index), "topic": "/a", "value": index}
+        for index in range(10)
+    ]
+    recording.write_text(
+        "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+    )
+    table = nt_recorder.build_table(
+        topics=["/a"],
+        recording_id=recording.name,
+        output_dir=str(tmp_path),
+        start=1000.0,
+        end=1010.0,
+        interval_seconds=1.0,
+        max_rows=3,
+    )
+    assert len(table["table"]) == 3
+    assert table["total_rows"] == 10
+    assert table["truncated"] is True
+
+
 def test_reader_capture_basis_relative_and_iso_bounds(tmp_path) -> None:
     """Capture-basis queries accept '+seconds' and ISO-8601 bounds."""
     recording_id = _write_capture_recording(tmp_path)

@@ -1077,6 +1077,66 @@ def test_nt_query_recording_capture_time_basis_is_legacy_safe(tmp_path) -> None:
     assert result["truncated"] is False
 
 
+def test_nt_query_recording_table(tmp_path) -> None:
+    """Table mode returns aligned rows and echoes the resolved window."""
+    recording = tmp_path / "table.ndjson"
+    events = [
+        {"time": 1000.0, "topic": "/a", "value": 1},
+        {"time": 1001.0, "topic": "/a", "value": 2},
+        {"time": 1002.0, "topic": "/a", "value": 3},
+        {"time": 1000.0, "topic": "/b", "value": 10},
+        {"time": 1002.0, "topic": "/b", "value": 30},
+    ]
+    recording.write_text(
+        "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+    )
+    result = nt_mcp_server.nt_query_recording(
+        topics=["/a", "/b"],
+        recording_id=recording.name,
+        output_dir=str(tmp_path),
+        start=1000.0,
+        end=1003.0,
+        output="table",
+        table_interval_seconds=1.0,
+        table_max_gap_seconds=1.5,
+    )
+    assert result["columns"] == ["/a", "/b"]
+    assert result["rows"] == 3
+    assert result["total_rows"] == 3
+    assert result["truncated"] is False
+    assert result["table"][1] == {
+        "time": 1001.0,
+        "values": {"/a": 2, "/b": 10},
+    }
+    assert result["window"]["basis"] == "event"
+    json.dumps(result)
+
+
+def test_nt_query_recording_table_respects_budget(tmp_path) -> None:
+    """Table clipping is visible through rows/total_rows/truncated."""
+    recording = tmp_path / "table-budget.ndjson"
+    events = [
+        {"time": float(1000 + index), "topic": "/a", "value": index}
+        for index in range(10)
+    ]
+    recording.write_text(
+        "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+    )
+    result = nt_mcp_server.nt_query_recording(
+        topics=["/a"],
+        recording_id=recording.name,
+        output_dir=str(tmp_path),
+        start=1000.0,
+        end=1010.0,
+        output="table",
+        table_interval_seconds=1.0,
+        max_rows=3,
+    )
+    assert result["rows"] == 3
+    assert result["total_rows"] == 10
+    assert result["truncated"] is True
+
+
 @pytest.mark.anyio
 async def test_nt_query_recording_returns_dict(mcp_synced: None, tmp_path) -> None:
     """Given a recording, nt_query_recording buckets events by topic."""

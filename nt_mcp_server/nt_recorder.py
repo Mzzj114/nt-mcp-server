@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import bisect
 import contextlib
 import datetime
 import fnmatch
@@ -933,6 +934,138 @@ def _window(start: float, end: float, samples: int) -> dict[str, Any]:
         "duration_seconds": span,
         "samples": samples,
         "mean_interval_seconds": (span / (samples - 1) if samples > 1 else None),
+    }
+
+
+def build_table(
+    prefixes: list[str] | None = None,
+    recording_id: str | None = None,
+    output_dir: str = "./recordings",
+    start: float | str | None = None,
+    end: float | str | None = None,
+    last_seconds: float | None = None,
+    limit: int | None = None,
+    sample_interval: float | None = None,
+    topics: list[str] | None = None,
+    regex: str | None = None,
+    wildcard: str | None = None,
+    interval_seconds: float = 0.1,
+    max_gap_seconds: float = 1.0,
+    max_rows: int = 5000,
+    time_basis: str = "event",
+) -> dict[str, Any]:
+    """Resample selected topics onto one common time grid.
+
+    Each grid row is ``{"time": t, "values": {topic: value | null}}``. A
+    topic's value is the last sample at or before ``t`` when that sample is
+    no more than ``max_gap_seconds`` old; otherwise null. ``max_rows`` caps
+    the number of built grid rows, while ``total_rows`` reports the
+    uncapped count so clipping is visible. ``start``/``end`` follow the
+    selected ``time_basis``.
+    """
+    if interval_seconds <= 0:
+        raise ValueError("interval_seconds must be greater than 0")
+    if max_gap_seconds < 0:
+        raise ValueError("max_gap_seconds must be non-negative")
+    if max_rows <= 0:
+        raise ValueError("max_rows must be greater than 0")
+    selector = TopicSelector(prefixes, topics, regex, wildcard)
+    if selector.empty:
+        raise ValueError("at least one topic selector is required")
+    path = _resolve_recording(recording_id, output_dir)
+    if path is None:
+        return {
+            "columns": [],
+            "table": [],
+            "total_rows": 0,
+            "truncated": False,
+            "interval_seconds": interval_seconds,
+            "max_gap_seconds": max_gap_seconds,
+            "window": describe_window(
+                recording_id=recording_id,
+                output_dir=output_dir,
+                start=start,
+                end=end,
+                last_seconds=last_seconds,
+                time_basis=time_basis,
+            ),
+        }
+    start, end = _apply_time_filter(path, start, end, last_seconds, time_basis)
+    series: dict[str, dict[str, list[Any]]] = {}
+    total_rows = 0
+    decimator = StreamDecimator(
+        sample_interval=(
+            sample_interval if sample_interval and sample_interval > 0 else None
+        )
+    )
+    for t, event in _iter_timed_events(path, time_basis):
+        topic = event.get("topic")
+        if not isinstance(topic, str) or not selector.matches(topic):
+            continue
+        if start is not None and t < start:
+            continue
+        if end is not None and t >= end:
+            continue
+        total_rows += 1
+        if not decimator.keep(topic, event.get("value"), t):
+            continue
+        bucket = series.setdefault(topic, {"times": [], "values": []})
+        if limit is not None and len(bucket["times"]) >= limit:
+            continue
+        bucket["times"].append(t)
+        bucket["values"].append(event.get("value"))
+
+    if not series:
+        return {
+            "columns": [],
+            "table": [],
+            "total_rows": 0,
+            "truncated": False,
+            "interval_seconds": interval_seconds,
+            "max_gap_seconds": max_gap_seconds,
+            "window": _window_payload(path, time_basis, start, end),
+        }
+
+    columns = sorted(series)
+    for bucket in series.values():
+        pairs = sorted(zip(bucket["times"], bucket["values"]), key=lambda p: p[0])
+        bucket["times"] = [pair[0] for pair in pairs]
+        bucket["values"] = [pair[1] for pair in pairs]
+
+    data_start = min(bucket["times"][0] for bucket in series.values())
+    data_end = max(bucket["times"][-1] for bucket in series.values())
+    grid_start = start if start is not None else data_start
+    grid_end = end if end is not None else data_end
+    if grid_end < grid_start:
+        total_points = 0
+    elif end is None:
+        total_points = int(math.floor((grid_end - grid_start) / interval_seconds)) + 1
+    else:
+        total_points = int(
+            math.ceil((grid_end - grid_start) / interval_seconds - 1e-9)
+        )
+        total_points = max(0, total_points)
+    build_count = min(total_points, max_rows)
+    rows: list[dict[str, Any]] = []
+    for index in range(build_count):
+        timestamp = grid_start + index * interval_seconds
+        values: dict[str, Any] = {}
+        for topic in columns:
+            bucket = series[topic]
+            position = bisect.bisect_right(bucket["times"], timestamp) - 1
+            if position >= 0 and timestamp - bucket["times"][position] <= max_gap_seconds:
+                values[topic] = bucket["values"][position]
+            else:
+                values[topic] = None
+        rows.append({"time": timestamp, "values": values})
+    return {
+        "columns": columns,
+        "table": rows,
+        "total_rows": total_points,
+        "truncated": total_points > len(rows),
+        "interval_seconds": interval_seconds,
+        "max_gap_seconds": max_gap_seconds,
+        "window": _window_payload(path, time_basis, start, end),
     }
 
 

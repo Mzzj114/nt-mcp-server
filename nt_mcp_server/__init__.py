@@ -149,9 +149,9 @@ OutputMode = Annotated[
     ),
 ]
 RecordingOutputMode = Annotated[
-    Literal["summary", "samples", "windows"],
+    Literal["summary", "samples", "windows", "table"],
     Field(
-        description="summary returns statistics over retained rows; samples returns timestamp/value rows; windows returns contiguous activity intervals per topic, split when the gap exceeds window_gap_seconds."
+        description="summary returns statistics over retained rows; samples returns timestamp/value rows; windows returns contiguous activity intervals per topic, split when the gap exceeds window_gap_seconds; table resamples selected topics onto one common time grid."
     ),
 ]
 WindowGap = Annotated[
@@ -160,6 +160,22 @@ WindowGap = Annotated[
         gt=0,
         allow_inf_nan=False,
         description="Maximum quiet gap in seconds between events of the same topic before a new activity window starts.",
+    ),
+]
+TableInterval = Annotated[
+    float,
+    Field(
+        gt=0,
+        allow_inf_nan=False,
+        description="Spacing in seconds of the common time grid used by output='table'.",
+    ),
+]
+TableMaxGap = Annotated[
+    float,
+    Field(
+        ge=0,
+        allow_inf_nan=False,
+        description="Maximum age in seconds of a topic's last sample for output='table'; older values become null.",
     ),
 ]
 RowLimit = Annotated[
@@ -1143,6 +1159,8 @@ def nt_query_recording(
     wildcard: WildcardFilter = None,
     time_basis: TimeBasis = "event",
     window_gap_seconds: WindowGap = 1.0,
+    table_interval_seconds: TableInterval = 0.1,
+    table_max_gap_seconds: TableMaxGap = 1.0,
 ) -> dict:
     """Return selected events from a recording.
 
@@ -1159,12 +1177,17 @@ def nt_query_recording(
 
     ``sample_interval`` decimates per-topic events before row limits; it
     does not generate regularly spaced samples. ``output="summary"`` returns
-    statistics over rows retained after filtering and output limits.
-    ``last_value`` is the last retained event, which may precede the end of
-    the selected window. ``output="windows"`` returns contiguous activity
-    intervals per topic, splitting when the quiet gap exceeds
-    ``window_gap_seconds``; each window reports ``start``, ``end``,
+    statistics over rows retained after filtering and output limits, with
+    value ``std`` and timing ``effective_hz``, ``max_gap_seconds`` and
+    ``span_seconds``. ``last_value`` is the last retained event, which may
+    precede the end of the selected window. ``output="windows"`` returns
+    contiguous activity intervals per topic, splitting when the quiet gap
+    exceeds ``window_gap_seconds``; each window reports ``start``, ``end``,
     ``duration_seconds``, ``samples`` and ``mean_interval_seconds``.
+    ``output="table"`` resamples selected topics onto a common grid spaced
+    by ``table_interval_seconds``; each row is
+    ``{"time": t, "values": {topic: value | null}}`` and a topic's last
+    sample is reused only within ``table_max_gap_seconds``.
     ``limit`` caps entries per topic (windows in window mode) and
     ``max_rows`` caps the total across topics; the response always states
     ``rows``, ``total_rows`` and ``truncated`` so clipping is never silent.
@@ -1173,13 +1196,13 @@ def nt_query_recording(
     whole response under 60,000 serialized characters; any rows it drops
     set ``truncated: True``.
     """
-    if output not in ("summary", "samples", "windows"):
+    if output not in ("summary", "samples", "windows", "table"):
         return {
             "recording_id": recording_id,
             "output": output,
             "error": (
                 f"unknown output mode {output!r}; valid modes: "
-                "'summary', 'samples', 'windows'"
+                "'summary', 'samples', 'windows', 'table'"
             ),
             "rows": 0,
             "total_rows": 0,
@@ -1236,6 +1259,50 @@ def nt_query_recording(
             "total_rows": 0,
             "truncated": False,
         }
+    if output == "table":
+        try:
+            table = nt_recorder.build_table(
+                prefixes=prefixes,
+                recording_id=recording_id,
+                output_dir=dir_,
+                start=start,
+                end=end,
+                last_seconds=last_seconds,
+                limit=limit,
+                sample_interval=sample_interval,
+                topics=topics,
+                regex=regex,
+                wildcard=wildcard,
+                interval_seconds=table_interval_seconds,
+                max_gap_seconds=table_max_gap_seconds,
+                max_rows=max_rows,
+                time_basis=time_basis,
+            )
+        except ValueError as exc:
+            return {
+                "recording_id": recording_id,
+                "error": str(exc),
+                "columns": [],
+                "table": [],
+                "rows": 0,
+                "total_rows": 0,
+                "truncated": False,
+            }
+        return enforce_max_chars(
+            {
+                "recording_id": recording_id,
+                "window": window,
+                "columns": table["columns"],
+                "table": table["table"],
+                "rows": len(table["table"]),
+                "total_rows": table["total_rows"],
+                "truncated": table["truncated"],
+                "interval_seconds": table["interval_seconds"],
+                "max_gap_seconds": table["max_gap_seconds"],
+            },
+            "table",
+            _MAX_RESPONSE_CHARS,
+        )
     if output == "windows":
         windows = nt_recorder.get_windows(
             prefixes=prefixes,
