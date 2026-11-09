@@ -22,6 +22,7 @@ import contextlib
 import datetime
 import fnmatch
 import json
+import math
 import os
 import re
 import signal
@@ -153,6 +154,7 @@ class Recorder:
         """Persist capture-clock metadata separately from the NDJSON events."""
         metadata = {
             "schema_version": 1,
+            "event_time_fields": ["time", "capture_time"],
             "recording_id": os.path.basename(path),
             "capture_started_at": self.capture_started_at,
             "capture_started_iso": _iso_timestamp(self.capture_started_at),
@@ -215,7 +217,7 @@ class Recorder:
         """
         if not self._decimator.keep(topic, value, time_seconds):
             return True
-        _write_event(file, topic, value, time_seconds)
+        _write_event(file, topic, value, time_seconds, capture_time=time.time())
         self.rows += 1
         self._topics.add(topic)
         if time_seconds > 0:
@@ -229,9 +231,21 @@ class Recorder:
         return True
 
 
-def _write_event(file, topic: str, value: Any, time_seconds: float) -> None:
-    """Write one NDJSON line and flush."""
+def _write_event(
+    file,
+    topic: str,
+    value: Any,
+    time_seconds: float,
+    capture_time: float | None = None,
+) -> None:
+    """Write one NDJSON line and flush.
+
+    ``capture_time`` is the local wall-clock write time; it is additive so
+    legacy readers that only use ``time`` remain compatible.
+    """
     line = {"time": time_seconds, "topic": topic, "value": value}
+    if capture_time is not None:
+        line["capture_time"] = capture_time
     file.write(json.dumps(line) + "\n")
     file.flush()
 
@@ -301,15 +315,30 @@ def _iter_events(path: str) -> Iterator[dict]:
                 )
 
 
-def _iter_timed_events(path: str) -> Iterator[tuple[float, dict]]:
-    """Yield ``(time, event)`` for events with a valid numeric time."""
+def _iter_timed_events(
+    path: str, time_basis: str = "event"
+) -> Iterator[tuple[float, dict]]:
+    """Yield ``(time, event)`` for events with a valid numeric time.
+
+    ``time_basis="event"`` (the default) uses the NT last-change ``time``
+    field. ``time_basis="capture"`` uses the local wall-clock
+    ``capture_time`` field written by newer recorders; legacy events without
+    that field are skipped.
+    """
+    key = "capture_time" if time_basis == "capture" else "time"
     for event in _iter_events(path):
-        raw_time = event.get("time")
-        if isinstance(raw_time, (int, float)):
+        raw_time = event.get(key)
+        if isinstance(raw_time, (int, float)) and not isinstance(raw_time, bool):
             yield float(raw_time), event
 
 
-def _time_bounds(path: str) -> tuple[float, float] | None:
+def _validate_time_basis(time_basis: str) -> None:
+    """Refuse unknown time bases before any file scan."""
+    if time_basis not in ("event", "capture"):
+        raise ValueError("time_basis must be 'event' or 'capture'")
+
+
+def _time_bounds(path: str, time_basis: str = "event") -> tuple[float, float] | None:
     """Return ``(min_time, max_time)`` across all valid events, or ``None``.
 
     Zero or negative timestamps are ignored. NT's ``last_change()`` can
@@ -318,7 +347,7 @@ def _time_bounds(path: str) -> tuple[float, float] | None:
     """
     min_time: float | None = None
     max_time: float | None = None
-    for t, _ in _iter_timed_events(path):
+    for t, _ in _iter_timed_events(path, time_basis):
         if t <= 0:
             continue
         if min_time is None or t < min_time:
@@ -456,20 +485,160 @@ def list_topics(
     return sorted(topics)
 
 
+def _require_capture_metadata(path: str) -> dict[str, Any]:
+    """Return capture metadata, refusing legacy files for capture-clock reads."""
+    metadata = _read_capture_metadata(path)
+    if metadata is None or metadata.get("capture_started_at") is None:
+        raise ValueError(
+            "time_basis='capture' requires recording capture metadata "
+            "(the .meta.json sidecar with capture_started_at); legacy "
+            "recordings support only time_basis='event'"
+        )
+    return metadata
+
+
+def _parse_time_bound(
+    value: float | str | None,
+    time_basis: str,
+    capture_started_at: float | None,
+) -> float | None:
+    """Resolve a numeric, ISO-8601 or ``+seconds`` time bound.
+
+    Numbers are absolute in the selected clock. Strings are allowed only
+    with ``time_basis="capture"``: ``+12.5`` / ``+12.5s`` is relative to
+    capture start, and ISO-8601 is an absolute wall-clock time (naive
+    timestamps are treated as UTC).
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if time_basis != "capture":
+            raise ValueError(
+                "ISO-8601 and '+seconds' time bounds require "
+                "time_basis='capture'"
+            )
+        text = value.strip()
+        if not text:
+            raise ValueError("time bound must not be empty")
+        if text.startswith("+"):
+            number = text[1:].rstrip("sS")
+            try:
+                delta = float(number)
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid relative time bound {value!r}; use '+12.5' "
+                    "or '+12.5s'"
+                ) from exc
+            if not math.isfinite(delta) or delta < 0:
+                raise ValueError("relative time bounds must be finite and non-negative")
+            assert capture_started_at is not None
+            return capture_started_at + delta
+        try:
+            parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"invalid ISO-8601 time bound {value!r}") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed.timestamp()
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("time bounds must be numbers, ISO-8601 strings, or '+seconds'")
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise ValueError("numeric time bounds must be finite and non-negative")
+    return number
+
+
 def _apply_time_filter(
     path: str,
-    start: float | None,
-    end: float | None,
+    start: float | str | None,
+    end: float | str | None,
     last_seconds: float | None,
+    time_basis: str = "event",
 ) -> tuple[float | None, float | None]:
-    """Resolve ``last_seconds`` into an absolute ``start`` bound."""
+    """Resolve relative/ISO bounds and ``last_seconds`` into absolute bounds."""
+    _validate_time_basis(time_basis)
+    capture_started_at = None
+    if time_basis == "capture":
+        capture_started_at = float(
+            _require_capture_metadata(path)["capture_started_at"]
+        )
+    resolved_start = _parse_time_bound(start, time_basis, capture_started_at)
+    resolved_end = _parse_time_bound(end, time_basis, capture_started_at)
     if last_seconds is not None:
-        bounds = _time_bounds(path)
+        bounds = _time_bounds(path, time_basis)
         if bounds is not None:
             computed_start = bounds[1] - last_seconds
-            if start is None or computed_start > start:
-                start = computed_start
-    return start, end
+            if resolved_start is None or computed_start > resolved_start:
+                resolved_start = computed_start
+    return resolved_start, resolved_end
+
+
+def _window_payload(
+    path: str,
+    time_basis: str,
+    start: float | None,
+    end: float | None,
+) -> dict[str, Any]:
+    """Describe the resolved query window and the recording's actual bounds."""
+    bounds = _time_bounds(path, time_basis)
+    metadata = _read_capture_metadata(path)
+    return {
+        "basis": time_basis,
+        "start": start,
+        "end": end,
+        "start_iso": (
+            _iso_timestamp(start) if time_basis == "capture" else None
+        ),
+        "end_iso": (_iso_timestamp(end) if time_basis == "capture" else None),
+        "data_start": bounds[0] if bounds is not None else None,
+        "data_end": bounds[1] if bounds is not None else None,
+        "capture_started_at": (
+            metadata.get("capture_started_at") if metadata is not None else None
+        ),
+        "capture_started_iso": (
+            metadata.get("capture_started_iso") if metadata is not None else None
+        ),
+        "capture_ended_at": (
+            metadata.get("capture_ended_at") if metadata is not None else None
+        ),
+        "capture_ended_iso": (
+            metadata.get("capture_ended_iso") if metadata is not None else None
+        ),
+    }
+
+
+def describe_window(
+    recording_id: str | None = None,
+    output_dir: str = "./recordings",
+    start: float | str | None = None,
+    end: float | str | None = None,
+    last_seconds: float | None = None,
+    time_basis: str = "event",
+) -> dict[str, Any]:
+    """Return the resolved query window for a recording.
+
+    Missing files return a window description with ``start``/``end`` as
+    given and ``data_start``/``data_end`` null.
+    """
+    path = _resolve_recording(recording_id, output_dir)
+    if path is None:
+        return {
+            "basis": time_basis,
+            "start": start,
+            "end": end,
+            "start_iso": None,
+            "end_iso": None,
+            "data_start": None,
+            "data_end": None,
+            "capture_started_at": None,
+            "capture_started_iso": None,
+            "capture_ended_at": None,
+            "capture_ended_iso": None,
+        }
+    resolved_start, resolved_end = _apply_time_filter(
+        path, start, end, last_seconds, time_basis
+    )
+    return _window_payload(path, time_basis, resolved_start, resolved_end)
 
 
 def _meta_result(payload: Any, key: str, rows: int, total_rows: int) -> dict[str, Any]:
@@ -491,13 +660,14 @@ def get_history(
     topic: str,
     recording_id: str | None = None,
     output_dir: str = "./recordings",
-    start: float | None = None,
-    end: float | None = None,
+    start: float | str | None = None,
+    end: float | str | None = None,
     last_seconds: float | None = None,
     limit: int | None = None,
     sample_interval: float | None = None,
     format: str = "samples",
     return_meta: bool = False,
+    time_basis: str = "event",
 ) -> list[dict] | dict:
     """Return the event history for one topic.
 
@@ -508,25 +678,31 @@ def get_history(
     the retained samples, and
     ``format="summary"`` returns min/max/mean/last.
 
+    ``time_basis="event"`` (default) filters on NT last-change timestamps.
+    ``time_basis="capture"`` uses each event's wall-clock ``capture_time``
+    and accepts ISO-8601 or ``+seconds`` bounds relative to capture start;
+    legacy recordings without capture timestamps are refused.
+
     Missing file returns ``[]``. Malformed lines are skipped with a warning
     to stderr.
 
     With ``return_meta=True`` the return value is
     ``{"samples": [...] | "summary": {...}, "rows": int, "total_rows": int,
-    "truncated": bool}`` instead: ``rows`` is the number of entries actually
-    returned, ``total_rows`` counts ALL matching events (counted even past
-    the ``limit`` clip), and ``truncated`` is ``total_rows > rows``.
+    "truncated": bool, "window": {...}}`` instead: ``rows`` is the number of
+    entries actually returned, ``total_rows`` counts ALL matching events
+    (counted even past the ``limit`` clip), and ``truncated`` is
+    ``total_rows > rows``.
     """
     path = _resolve_recording(recording_id, output_dir)
     if path is None:
         return [] if not return_meta else _meta_result([], "samples", 0, 0)
-    start, end = _apply_time_filter(path, start, end, last_seconds)
+    start, end = _apply_time_filter(path, start, end, last_seconds, time_basis)
     events: list[dict] = []
     total_rows = 0
     decimator = StreamDecimator(
         sample_interval=sample_interval if sample_interval and sample_interval > 0 else None
     )
-    for t, event in _iter_timed_events(path):
+    for t, event in _iter_timed_events(path, time_basis):
         if event.get("topic") != topic:
             continue
         if start is not None and t < start:
@@ -544,7 +720,9 @@ def get_history(
         events = summarize(events)
     if return_meta:
         key = "summary" if format == "summary" else "samples"
-        return _meta_result(events, key, rows, total_rows)
+        result = _meta_result(events, key, rows, total_rows)
+        result["window"] = _window_payload(path, time_basis, start, end)
+        return result
     return events
 
 
@@ -684,14 +862,15 @@ def get_windows(
     prefixes: list[str] | None = None,
     recording_id: str | None = None,
     output_dir: str = "./recordings",
-    start: float | None = None,
-    end: float | None = None,
+    start: float | str | None = None,
+    end: float | str | None = None,
     last_seconds: float | None = None,
     limit: int | None = None,
     topics: list[str] | None = None,
     regex: str | None = None,
     wildcard: str | None = None,
     gap_seconds: float = 1.0,
+    time_basis: str = "event",
 ) -> dict[str, list[dict[str, Any]]]:
     """Return contiguous activity windows per topic.
 
@@ -709,9 +888,9 @@ def get_windows(
     path = _resolve_recording(recording_id, output_dir)
     if path is None:
         return {}
-    start, end = _apply_time_filter(path, start, end, last_seconds)
+    start, end = _apply_time_filter(path, start, end, last_seconds, time_basis)
     times: dict[str, list[float]] = {}
-    for t, event in _iter_timed_events(path):
+    for t, event in _iter_timed_events(path, time_basis):
         topic = event.get("topic")
         if not isinstance(topic, str) or not selector.matches(topic):
             continue
@@ -762,8 +941,8 @@ def subscribe_offline(
     prefixes: list[str] | None = None,
     recording_id: str | None = None,
     output_dir: str = "./recordings",
-    start: float | None = None,
-    end: float | None = None,
+    start: float | str | None = None,
+    end: float | str | None = None,
     last_seconds: float | None = None,
     limit: int | None = None,
     sample_interval: float | None = None,
@@ -772,6 +951,7 @@ def subscribe_offline(
     topics: list[str] | None = None,
     regex: str | None = None,
     wildcard: str | None = None,
+    time_basis: str = "event",
 ) -> dict[str, Any]:
     """Return events matching topic selectors.
 
@@ -785,11 +965,17 @@ def subscribe_offline(
     ``format="summary"`` behave like live ``nt_subscribe``. Missing file
     returns ``{}``. Malformed lines are skipped with a warning to stderr.
 
+    ``time_basis="event"`` (default) filters on NT last-change timestamps.
+    ``time_basis="capture"`` uses each event's wall-clock ``capture_time``
+    and accepts ISO-8601 or ``+seconds`` bounds relative to capture start;
+    legacy recordings without capture timestamps are refused.
+
     With ``return_meta=True`` the return value is
     ``{"topics": {topic: [...] | summary}, "rows": int, "total_rows": int,
-    "truncated": bool}`` instead: ``rows`` is the number of entries actually
-    returned, ``total_rows`` counts ALL matching events (counted even past
-    the ``limit`` clip), and ``truncated`` is ``total_rows > rows``.
+    "truncated": bool, "window": {...}}`` instead: ``rows`` is the number of
+    entries actually returned, ``total_rows`` counts ALL matching events
+    (counted even past the ``limit`` clip), and ``truncated`` is
+    ``total_rows > rows``.
 
     Note: do not call on a recording currently being written.
     """
@@ -799,13 +985,13 @@ def subscribe_offline(
     path = _resolve_recording(recording_id, output_dir)
     if path is None:
         return {} if not return_meta else _meta_result({}, "topics", 0, 0)
-    start, end = _apply_time_filter(path, start, end, last_seconds)
+    start, end = _apply_time_filter(path, start, end, last_seconds, time_basis)
     out: dict[str, list[dict]] = {}
     total_rows = 0
     decimator = StreamDecimator(
         sample_interval=sample_interval if sample_interval and sample_interval > 0 else None
     )
-    for t, event in _iter_timed_events(path):
+    for t, event in _iter_timed_events(path, time_basis):
         topic = event.get("topic")
         if not isinstance(topic, str):
             continue
@@ -826,7 +1012,9 @@ def subscribe_offline(
         out = {topic: summarize(samples) for topic, samples in out.items()}
     if return_meta:
         key = "summary" if format == "summary" else "topics"
-        return _meta_result(out, key, rows, total_rows)
+        result = _meta_result(out, key, rows, total_rows)
+        result["window"] = _window_payload(path, time_basis, start, end)
+        return result
     return out
 
 

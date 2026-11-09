@@ -1011,6 +1011,72 @@ def test_nt_query_recording_windows_respects_budget(tmp_path) -> None:
     assert result["truncated"] is True
 
 
+def _write_capture_recording(tmp_path) -> str:
+    """Write a capture-clock recording plus its metadata sidecar."""
+    recording = tmp_path / "capture.ndjson"
+    events = [
+        {"time": 5000.0, "capture_time": 1000.0, "topic": "/x", "value": 1},
+        {"time": 5001.0, "capture_time": 1001.0, "topic": "/x", "value": 2},
+        {"time": 5004.0, "capture_time": 1004.0, "topic": "/x", "value": 3},
+    ]
+    recording.write_text(
+        "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+    )
+    (tmp_path / "capture.meta.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "recording_id": recording.name,
+                "capture_started_at": 999.0,
+                "capture_started_iso": "1970-01-01T00:16:39+00:00",
+                "capture_ended_at": 1005.0,
+                "capture_ended_iso": "1970-01-01T00:16:45+00:00",
+                "capture_duration_seconds": 6.0,
+                "event_span_seconds": 4.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return recording.name
+
+
+def test_nt_query_recording_capture_time_basis(tmp_path) -> None:
+    """Capture-basis queries accept relative/ISO bounds and echo the window."""
+    recording_id = _write_capture_recording(tmp_path)
+    result = nt_mcp_server.nt_query_recording(
+        topics=["/x"],
+        recording_id=recording_id,
+        output_dir=str(tmp_path),
+        start="+1.0",
+        end="+3.5",
+        time_basis="capture",
+    )
+    assert [entry["value"] for entry in result["topics"]["/x"]] == [1, 2]
+    assert result["window"]["basis"] == "capture"
+    assert result["window"]["start"] == 1000.0
+    assert result["window"]["end"] == 1002.5
+    assert result["window"]["start_iso"] is not None
+    assert result["window"]["capture_started_at"] == 999.0
+    json.dumps(result)
+
+
+def test_nt_query_recording_capture_time_basis_is_legacy_safe(tmp_path) -> None:
+    """A legacy file without capture timestamps returns a structured error."""
+    recording = tmp_path / "legacy.ndjson"
+    recording.write_text(
+        json.dumps({"time": 1000.0, "topic": "/x", "value": 1}), encoding="utf-8"
+    )
+    result = nt_mcp_server.nt_query_recording(
+        topics=["/x"],
+        recording_id=recording.name,
+        output_dir=str(tmp_path),
+        time_basis="capture",
+    )
+    assert "requires recording capture metadata" in result["error"]
+    assert result["rows"] == 0
+    assert result["truncated"] is False
+
+
 @pytest.mark.anyio
 async def test_nt_query_recording_returns_dict(mcp_synced: None, tmp_path) -> None:
     """Given a recording, nt_query_recording buckets events by topic."""

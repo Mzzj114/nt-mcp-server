@@ -431,6 +431,116 @@ def test_reader_windows_respects_time_filter_and_limit(tmp_path) -> None:
     assert windows["/drive/x"][0]["end"] == 1002.0
 
 
+def _write_capture_recording(tmp_path) -> str:
+    """Write a recording with per-event capture times plus a metadata sidecar."""
+    recording = tmp_path / "capture.ndjson"
+    events = [
+        {"time": 5000.0, "capture_time": 1000.0, "topic": "/x", "value": 1},
+        {"time": 5001.0, "capture_time": 1001.0, "topic": "/x", "value": 2},
+        {"time": 5004.0, "capture_time": 1004.0, "topic": "/x", "value": 3},
+    ]
+    recording.write_text(
+        "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+    )
+    metadata = {
+        "schema_version": 1,
+        "recording_id": recording.name,
+        "capture_started_at": 999.0,
+        "capture_started_iso": "1970-01-01T00:16:39+00:00",
+        "capture_ended_at": 1005.0,
+        "capture_ended_iso": "1970-01-01T00:16:45+00:00",
+        "capture_duration_seconds": 6.0,
+        "event_span_seconds": 4.0,
+    }
+    (tmp_path / "capture.meta.json").write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+    return recording.name
+
+
+def test_reader_capture_basis_relative_and_iso_bounds(tmp_path) -> None:
+    """Capture-basis queries accept '+seconds' and ISO-8601 bounds."""
+    recording_id = _write_capture_recording(tmp_path)
+    relative = nt_recorder.subscribe_offline(
+        topics=["/x"],
+        recording_id=recording_id,
+        output_dir=str(tmp_path),
+        start="+1.0",
+        end="+3.5",
+        time_basis="capture",
+        return_meta=True,
+    )
+    assert [entry["value"] for entry in relative["topics"]["/x"]] == [1, 2]
+    assert relative["window"]["basis"] == "capture"
+    assert relative["window"]["start"] == 1000.0
+    assert relative["window"]["end"] == 1002.5
+    assert relative["window"]["start_iso"] is not None
+    assert relative["window"]["capture_started_at"] == 999.0
+
+    iso = nt_recorder.subscribe_offline(
+        topics=["/x"],
+        recording_id=recording_id,
+        output_dir=str(tmp_path),
+        start="1970-01-01T00:16:40Z",
+        end="1970-01-01T00:16:42Z",
+        time_basis="capture",
+    )
+    assert [entry["value"] for entry in iso["/x"]] == [1, 2]
+
+
+def test_reader_capture_basis_last_seconds_uses_capture_clock(tmp_path) -> None:
+    """last_seconds measures from the latest capture_time, not the NT clock."""
+    recording_id = _write_capture_recording(tmp_path)
+    recent = nt_recorder.get_history(
+        "/x",
+        recording_id=recording_id,
+        output_dir=str(tmp_path),
+        last_seconds=1.5,
+        time_basis="capture",
+        return_meta=True,
+    )
+    assert [entry["value"] for entry in recent["samples"]] == [3]
+    assert recent["window"]["start"] == pytest.approx(1002.5)
+
+
+def test_reader_capture_basis_requires_metadata(tmp_path) -> None:
+    """Legacy files without capture timestamps refuse the capture clock."""
+    recording_id = _write_synthetic_recording(tmp_path, "/x", 3)
+    with pytest.raises(ValueError, match="requires recording capture metadata"):
+        nt_recorder.subscribe_offline(
+            topics=["/x"],
+            recording_id=recording_id,
+            output_dir=str(tmp_path),
+            time_basis="capture",
+        )
+
+
+def test_reader_event_basis_rejects_string_bounds(tmp_path) -> None:
+    """ISO/relative strings are ambiguous in the NT event clock."""
+    recording_id = _write_capture_recording(tmp_path)
+    with pytest.raises(ValueError, match="require time_basis='capture'"):
+        nt_recorder.subscribe_offline(
+            topics=["/x"],
+            recording_id=recording_id,
+            output_dir=str(tmp_path),
+            start="+1.0",
+            time_basis="event",
+        )
+
+
+@pytest.mark.anyio
+async def test_recorder_writes_capture_time(manager: NTManager, tmp_path) -> None:
+    """New recordings include a positive wall-clock capture_time per event."""
+    recorder = nt_recorder.Recorder(
+        manager, output_dir=str(tmp_path), prefixes=["/SmartDashboard/"], duration=1.0
+    )
+    path = await recorder.run()
+    with open(path, "r", encoding="utf-8") as file:
+        event = json.loads(next(line for line in file if line.strip()))
+    assert isinstance(event["capture_time"], float)
+    assert event["capture_time"] > 0
+
+
 @pytest.mark.anyio
 async def test_reader_list_recordings_and_most_recent_default(
     manager: NTManager, tmp_path
